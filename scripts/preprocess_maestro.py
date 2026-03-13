@@ -6,8 +6,8 @@ note events from the paired MIDI file, and saves one ``*_audio.npy`` and one
 
 Usage::
 
-    python scripts/preprocess_maestro.py \\
-        --input  data/maestro/maestro-v3.0.0 \\
+    python scripts/preprocess_maestro.py \
+        --input  /mnt/d/Datasets/maestro-v3.0.0 \
         --output data/processed/maestro
 
 The ``--workers`` flag controls the number of parallel librosa load/resample

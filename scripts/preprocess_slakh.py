@@ -7,8 +7,8 @@ pairs under ``<output>/<split>/``.
 
 Usage::
 
-    python scripts/preprocess_slakh.py \\
-        --input  data/slakh2100_flac_redux \\
+    python scripts/preprocess_slakh.py \
+        --input  /mnt/d/Datasets/slakh2100_flac_redux \
         --output data/processed/slakh
 
 Pass ``--dry-run`` to process only the first 5 tracks of each split without
