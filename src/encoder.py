@@ -77,7 +77,9 @@ class SpectrogramEncoder(nn.Module):
             batch_first=True,
             norm_first=True,  # Pre-LN for training stability (T5 convention)
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers, enable_nested_tensor=False
+        )
 
     def forward(self, spectrogram: torch.Tensor) -> torch.Tensor:
         """Encode a log-mel spectrogram into contextual frame representations.

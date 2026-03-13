@@ -88,6 +88,18 @@ class EventDecoder(nn.Module):
         x = self.pos_enc(x)
         x = self.dropout(x)
 
+        # Ensure both masks use the same dtype to avoid deprecation warnings.
+        # generate_square_subsequent_mask returns a float additive mask; if the
+        # padding mask is bool, convert it to a matching additive float mask.
+        if tgt_mask is not None and tgt_padding_mask is not None:
+            if tgt_padding_mask.dtype == torch.bool and tgt_mask.is_floating_point():
+                float_pad = torch.zeros(
+                    tgt_padding_mask.shape,
+                    dtype=tgt_mask.dtype,
+                    device=tgt_padding_mask.device,
+                )
+                tgt_padding_mask = float_pad.masked_fill(tgt_padding_mask, float("-inf"))
+
         x = self.decoder(
             tgt=x,
             memory=enc_out,

@@ -1,3 +1,9 @@
 .venv
 
 __pycache__
+
+data/processed
+runs/
+checkpoints/
+
+*.pt
