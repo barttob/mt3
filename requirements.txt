@@ -1,0 +1,11 @@
+torch>=2.1
+torchaudio>=2.1
+numpy>=1.24
+librosa>=0.10
+pretty_midi>=0.2.10
+mir_eval>=0.7
+soundfile>=0.12
+pyyaml>=6.0
+tqdm
+tensorboard
+matplotlib
