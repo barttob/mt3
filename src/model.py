@@ -83,6 +83,7 @@ class MT3Model(nn.Module):
         waveform: torch.Tensor,
         max_len: int = 1024,
         temperature: float = 0.0,
+        prompt_tokens: Optional[torch.Tensor | list[int]] = None,
     ) -> torch.Tensor:
         """Autoregressive greedy / temperature-sampled decoding.
 
@@ -96,6 +97,8 @@ class MT3Model(nn.Module):
                 initial ``<sos>``).
             temperature: Sampling temperature. ``0.0`` (default) uses greedy
                 argmax; positive values sample from the softmax distribution.
+            prompt_tokens: Optional decoder prompt. When provided this should
+                already contain ``<sos>`` and any tie-section tokens.
 
         Returns:
             generated: Token ID tensor of shape (B, L) where L ≤ max_len.
@@ -109,9 +112,22 @@ class MT3Model(nn.Module):
         sos_id = self.tokenizer.special["<sos>"]
         eos_id = self.tokenizer.special["<eos>"]
 
-        generated = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
+        if prompt_tokens is None:
+            generated = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
+        else:
+            generated = torch.as_tensor(prompt_tokens, dtype=torch.long, device=device)
+            if generated.ndim == 1:
+                generated = generated.unsqueeze(0).expand(B, -1).clone()
+            elif generated.ndim != 2 or generated.size(0) != B:
+                raise ValueError(
+                    f"prompt_tokens must have shape (P,) or (B, P); got {tuple(generated.shape)}"
+                )
+            if generated.size(1) > max_len:
+                raise ValueError(
+                    f"Prompt length {generated.size(1)} exceeds max_len={max_len}."
+                )
 
-        for _ in range(max_len - 1):
+        for _ in range(max_len - generated.size(1)):
             S = generated.size(1)
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=device)
             logits = self.decoder(generated, enc_out, tgt_mask=tgt_mask)
@@ -160,6 +176,10 @@ def build_model(config: Union[str, Path, dict]) -> MT3Model:
     tokenizer = MidiTokenizer(
         time_step_ms=tok_cfg.get("time_step_ms", 8),
         max_time_steps=tok_cfg.get("max_time_steps", 600),
+        num_programs=tok_cfg.get(
+            "num_programs",
+            129 if tok_cfg.get("multi_instrument", False) else 128,
+        ),
         multi_instrument=tok_cfg.get("multi_instrument", False),
     )
 

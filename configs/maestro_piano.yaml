@@ -3,8 +3,8 @@ data:
   train_dir: data/processed/maestro/train
   val_dir: data/processed/maestro/validation
   sample_rate: 16000
-  segment_samples: 256000          # 16 seconds → 2000 mel frames
-  n_frames: 256                    # sampled frames per training example
+  segment_samples: 32768           # 2.048 seconds at 16 kHz (256 frames * 128 hop)
+  n_frames: 256                    # target encoder frames per example
 
 audio:
   n_fft: 2048

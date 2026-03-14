@@ -9,7 +9,7 @@ Token vocabulary layout (IDs):
     604 – 731   velocity    (128 values, 0–127)
     732 – 859   note_on     (128 MIDI pitches)
     860 – 987   note_off    (128 MIDI pitches)
-    988 – 1115  program     (128 MIDI programs, multi-instrument only)
+    988 – 1116  program     (129 program IDs incl. drums in multi-instrument mode)
 """
 
 from __future__ import annotations
@@ -32,8 +32,9 @@ class MidiTokenizer:
 
     * **Piano-only** (``multi_instrument=False``): no program tokens are
       added; all notes are implicitly assumed to be program 0 (piano).
-    * **Multi-instrument** (``multi_instrument=True``): 128 program tokens
-      are appended to the vocabulary (IDs 988–1115).
+    * **Multi-instrument** (``multi_instrument=True``): program tokens are
+      appended to the vocabulary (IDs 988+). By default this includes the
+      dedicated drum ID 128, so there are 129 program tokens.
 
     Args:
         time_step_ms: Duration of one time-shift bin in milliseconds.
@@ -41,7 +42,8 @@ class MidiTokenizer:
             ``time_step_ms * max_time_steps`` ms of audio per segment).
         num_velocities: Number of MIDI velocity levels (always 128).
         num_pitches: Number of MIDI pitches (always 128).
-        num_programs: Number of MIDI program numbers (always 128).
+        num_programs: Number of program IDs. Slakh-style training should use
+            129 to cover MIDI programs 0–127 plus the dedicated drum ID 128.
         multi_instrument: Whether to include program tokens in the
             vocabulary and token sequences.
     """
@@ -52,7 +54,7 @@ class MidiTokenizer:
         max_time_steps: int = 600,
         num_velocities: int = 128,
         num_pitches: int = 128,
-        num_programs: int = 128,
+        num_programs: int = 129,
         multi_instrument: bool = False,
     ) -> None:
         self.time_step_ms = time_step_ms
@@ -86,7 +88,7 @@ class MidiTokenizer:
 
         if multi_instrument:
             self.program_offset: int = offset
-            offset += num_programs        # 988 – 1115
+            offset += num_programs        # 988 – 1116 when num_programs=129
         else:
             self.program_offset = -1      # sentinel: unused
 
@@ -100,6 +102,26 @@ class MidiTokenizer:
     def vocab_size(self) -> int:
         """Total number of tokens in the vocabulary."""
         return self._vocab_size
+
+    def build_tie_prefix(
+        self,
+        prev_active_notes: Optional[list[ActiveNote]] = None,
+    ) -> list[int]:
+        """Build a decoder prefix for a segment's tie section."""
+        tokens: list[int] = [self.special["<sos>"]]
+        if prev_active_notes:
+            for pitch, velocity, program in prev_active_notes:
+                if self.multi_instrument and not 0 <= program < self.num_programs:
+                    raise ValueError(
+                        f"Program {program} out of range for tokenizer with "
+                        f"{self.num_programs} programs."
+                    )
+                if self.multi_instrument:
+                    tokens.append(self.program_offset + program)
+                tokens.append(self.velocity_offset + velocity)
+                tokens.append(self.note_on_offset + pitch)
+        tokens.append(self.special["<tie>"])
+        return tokens
 
     # ------------------------------------------------------------------
     # Encoding: notes → tokens
@@ -145,22 +167,17 @@ class MidiTokenizer:
         Returns:
             List of integer token IDs.
         """
-        tokens: list[int] = [self.special["<sos>"]]
-
-        # ---- Tie section ------------------------------------------------
-        if prev_active_notes:
-            for pitch, velocity, program in prev_active_notes:
-                if self.multi_instrument:
-                    tokens.append(self.program_offset + program)
-                tokens.append(self.velocity_offset + velocity)
-                tokens.append(self.note_on_offset + pitch)
-
-        tokens.append(self.special["<tie>"])
+        tokens = self.build_tie_prefix(prev_active_notes)
 
         # ---- Event section ----------------------------------------------
         events: list[tuple[float, str, int, int, int]] = []  # (t_rel, type, pitch, vel, prog)
 
         for onset, offset, pitch, vel, prog in notes:
+            if self.multi_instrument and not 0 <= prog < self.num_programs:
+                raise ValueError(
+                    f"Program {prog} out of range for tokenizer with "
+                    f"{self.num_programs} programs."
+                )
             # Note-on: onset falls inside segment
             if segment_start_s <= onset < segment_end_s:
                 t_rel = onset - segment_start_s
@@ -228,8 +245,8 @@ class MidiTokenizer:
             ``velocity`` (int), ``program`` (int).
         """
         notes: list[dict] = []
-        # (pitch, program) → {"onset": float, "velocity": int, "program": int}
-        open_notes: dict[tuple[int, int], dict] = {}
+        # (pitch, program) → list of open notes in onset order
+        open_notes: dict[tuple[int, int], list[dict]] = {}
 
         current_time_s: float = segment_start_s
         current_velocity: int = 64   # sensible default
@@ -291,12 +308,12 @@ class MidiTokenizer:
                 pitch = tok - self.note_on_offset
                 onset = segment_start_s if in_tie_section else current_time_s
                 key = (pitch, current_program)
-                open_notes[key] = {
+                open_notes.setdefault(key, []).append({
                     "onset": onset,
                     "velocity": current_velocity,
                     "program": current_program,
                     "pitch": pitch,
-                }
+                })
                 i += 1
                 continue
 
@@ -305,14 +322,18 @@ class MidiTokenizer:
                 pitch = tok - self.note_off_offset
                 # Try matching open note; fall back to any open note with this pitch
                 key = (pitch, current_program)
-                if key not in open_notes:
-                    # Scan for any open note with this pitch regardless of program
-                    for k in list(open_notes.keys()):
-                        if k[0] == pitch:
-                            key = k
-                            break
-                if key in open_notes:
-                    note = open_notes.pop(key)
+                note_bucket = open_notes.get(key)
+                if not note_bucket:
+                    matching_keys = [
+                        k for k, bucket in open_notes.items() if k[0] == pitch and bucket
+                    ]
+                    if matching_keys:
+                        key = min(matching_keys, key=lambda item: open_notes[item][0]["onset"])
+                        note_bucket = open_notes[key]
+                if note_bucket:
+                    note = note_bucket.pop(0)
+                    if not note_bucket:
+                        open_notes.pop(key, None)
                     note["offset"] = current_time_s
                     notes.append(note)
                 i += 1
@@ -322,9 +343,10 @@ class MidiTokenizer:
             i += 1
 
         # Close any notes that were never given a note_off
-        for note in open_notes.values():
-            note["offset"] = current_time_s
-            notes.append(note)
+        for note_bucket in open_notes.values():
+            for note in note_bucket:
+                note["offset"] = current_time_s
+                notes.append(note)
 
         notes.sort(key=lambda n: (n["onset"], n["pitch"]))
         return notes
@@ -427,8 +449,8 @@ if __name__ == "__main__":
     print("=" * 60)
 
     tok_multi = MidiTokenizer(multi_instrument=True)
-    print(f"  vocab_size = {tok_multi.vocab_size}  (expected 1116)")
-    assert tok_multi.vocab_size == 1116, f"Got {tok_multi.vocab_size}"
+    print(f"  vocab_size = {tok_multi.vocab_size}  (expected 1117)")
+    assert tok_multi.vocab_size == 1117, f"Got {tok_multi.vocab_size}"
 
     notes_multi: list[NoteEvent] = [
         (0.050, 0.400, 60, 80,  0),   # Piano C4
@@ -488,7 +510,23 @@ if __name__ == "__main__":
 
     # ------------------------------------------------------------------
     print("=" * 60)
-    print("Test 4: token_type helper")
+    print("Test 4: Repeated-note decoding keeps both notes")
+    print("=" * 60)
+
+    repeated_notes: list[NoteEvent] = [
+        (0.100, 0.400, 60, 80, 0),
+        (0.200, 0.500, 60, 90, 0),
+    ]
+    tokens = tok_piano.notes_to_tokens(repeated_notes, 0.0, 2.048)
+    decoded = tok_piano.tokens_to_notes(tokens, 0.0)
+    assert _notes_match(repeated_notes, decoded), (
+        f"Repeated-note round-trip mismatch!\n  orig={repeated_notes}\n  dec={decoded}"
+    )
+    print("  PASSED\n")
+
+    # ------------------------------------------------------------------
+    print("=" * 60)
+    print("Test 5: token_type helper")
     print("=" * 60)
 
     t = MidiTokenizer(multi_instrument=True)
@@ -505,7 +543,7 @@ if __name__ == "__main__":
     assert t.token_type(860) == "note_off(0)"
     assert t.token_type(987) == "note_off(127)"
     assert t.token_type(988) == "program(0)"
-    assert t.token_type(1115) == "program(127)"
+    assert t.token_type(1116) == "program(128)"
     print("  PASSED\n")
 
     print("All tests passed.")

@@ -98,6 +98,18 @@ def _make_dry_run_loader(
     return DataLoader(dataset, batch_size=B, shuffle=False, drop_last=True)
 
 
+def _resolve_segment_samples(config: dict) -> int:
+    """Resolve the waveform window length used for training/inference."""
+    data_cfg = config.get("data", {})
+    audio_cfg = config.get("audio", {})
+
+    n_frames = data_cfg.get("n_frames")
+    hop_length = audio_cfg.get("hop_length")
+    if n_frames is not None and hop_length is not None:
+        return int(n_frames) * int(hop_length)
+    return int(data_cfg.get("segment_samples", 256_000))
+
+
 def _compute_val_loss(
     model: MT3Model,
     val_loader: DataLoader,
@@ -171,6 +183,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     data_cfg = config.get("data", {})
     train_cfg = config.get("training", {})
     model_cfg = config.get("model", {})
+    segment_samples = _resolve_segment_samples(config)
 
     batch_size: int = train_cfg.get("batch_size", 8)
     grad_accum: int = train_cfg.get("grad_accum_steps", 1)
@@ -204,12 +217,15 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     # Data loaders
     # ------------------------------------------------------------------
     if dry_run:
-        train_loader = _make_dry_run_loader(model.tokenizer, data_cfg, train_cfg)
-        val_loader = _make_dry_run_loader(model.tokenizer, data_cfg, train_cfg, num_batches=2)
+        dry_data_cfg = dict(data_cfg)
+        dry_data_cfg["segment_samples"] = segment_samples
+        train_loader = _make_dry_run_loader(model.tokenizer, dry_data_cfg, train_cfg)
+        val_loader = _make_dry_run_loader(
+            model.tokenizer, dry_data_cfg, train_cfg, num_batches=2
+        )
         print("[train] dry-run: using synthetic data loaders")
     else:
         sample_rate: int = data_cfg.get("sample_rate", 16_000)
-        segment_samples: int = data_cfg.get("segment_samples", 256_000)
 
         train_ds = TranscriptionDataset(
             data_dir=data_cfg["train_dir"],

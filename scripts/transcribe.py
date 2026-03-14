@@ -105,6 +105,34 @@ def notes_to_midi(notes: list[dict], output_path: Path) -> None:
     midi.write(str(output_path))
 
 
+def _resolve_window_sizes(
+    config: dict,
+    segment_seconds: float | None,
+    hop_seconds: float | None,
+) -> tuple[int, int]:
+    """Resolve inference window sizes from config defaults and CLI overrides."""
+    data_cfg = config.get("data", {})
+    audio_cfg = config.get("audio", {})
+    sample_rate = int(data_cfg.get("sample_rate", 16000))
+
+    if segment_seconds is not None:
+        segment_samples = int(segment_seconds * sample_rate)
+    else:
+        n_frames = data_cfg.get("n_frames")
+        hop_length = audio_cfg.get("hop_length")
+        if n_frames is not None and hop_length is not None:
+            segment_samples = int(n_frames) * int(hop_length)
+        else:
+            segment_samples = int(data_cfg.get("segment_samples", 256_000))
+
+    if hop_seconds is not None:
+        hop_samples = int(hop_seconds * sample_rate)
+    else:
+        hop_samples = max(1, segment_samples // 2)
+
+    return segment_samples, hop_samples
+
+
 def transcribe_full_audio(
     model,
     audio: np.ndarray,
@@ -118,10 +146,8 @@ def transcribe_full_audio(
     """Slide a window across ``audio`` and decode MIDI events.
 
     Handles notes that span segment boundaries using the tie-section
-    mechanism from MT3 (notes still open at the end of a segment are tracked
-    and passed as ``prev_active`` to the tokenizer for the next segment —
-    but at inference time we simply merge the decoded note lists and
-    de-duplicate).
+    mechanism from MT3. Notes still active at the next hop are converted into
+    a ``<sos> ... <tie>`` decoder prompt for the following segment.
 
     Args:
         model: Loaded :class:`~src.model.MT3Model` in eval mode.
@@ -150,6 +176,7 @@ def transcribe_full_audio(
 
     num_segments = max(1, (total_samples - segment_samples + hop_samples) // hop_samples)
     all_notes: list[dict] = []
+    prev_active: list[tuple[int, int, int]] = []
 
     for i in range(num_segments):
         start = i * hop_samples
@@ -162,14 +189,30 @@ def transcribe_full_audio(
 
         waveform = torch.tensor(segment, dtype=torch.float32).unsqueeze(0).to(device)
         segment_start_s = start / sample_rate
+        prompt_tokens = model.tokenizer.build_tie_prefix(prev_active)
 
-        token_ids = model.transcribe(waveform, max_len=max_len, temperature=temperature)
+        token_ids = model.transcribe(
+            waveform,
+            max_len=max_len,
+            temperature=temperature,
+            prompt_tokens=prompt_tokens,
+        )
         tokens = token_ids[0].cpu().tolist()
 
         segment_notes = model.tokenizer.tokens_to_notes(
             tokens, segment_start_s=segment_start_s
         )
         all_notes.extend(segment_notes)
+
+        next_start_s = (start + hop_samples) / sample_rate
+        prev_active = sorted(
+            [
+                (note["pitch"], note["velocity"], note["program"])
+                for note in segment_notes
+                if note["onset"] < next_start_s < note["offset"]
+            ],
+            key=lambda item: (item[2], item[0], item[1]),
+        )
 
     all_notes = deduplicate_notes(all_notes)
     return all_notes
@@ -224,13 +267,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--segment-seconds",
         type=float,
-        default=16.0,
+        default=None,
         help="Audio segment length in seconds for sliding-window inference.",
     )
     parser.add_argument(
         "--hop-seconds",
         type=float,
-        default=8.0,
+        default=None,
         help="Hop between consecutive segments in seconds.",
     )
     parser.add_argument(
@@ -257,8 +300,9 @@ def main(argv: list[str] | None = None) -> None:
         config = yaml.safe_load(fh)
 
     sample_rate: int = config.get("data", {}).get("sample_rate", 16000)
-    segment_samples = int(args.segment_seconds * sample_rate)
-    hop_samples = int(args.hop_seconds * sample_rate)
+    segment_samples, hop_samples = _resolve_window_sizes(
+        config, args.segment_seconds, args.hop_seconds
+    )
 
     # ------------------------------------------------------------------
     # Model

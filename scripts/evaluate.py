@@ -104,6 +104,46 @@ def _print_metrics(
             print(f"{pad}  {key:<22s}: {metrics[key] * 100:.2f} %")
 
 
+def _resolve_window_sizes(
+    config: dict,
+    segment_seconds: float | None,
+    hop_seconds: float | None,
+) -> tuple[int, int]:
+    """Resolve evaluation window sizes from config defaults and CLI overrides."""
+    data_cfg = config.get("data", {})
+    audio_cfg = config.get("audio", {})
+    sample_rate = int(data_cfg.get("sample_rate", 16000))
+
+    if segment_seconds is not None:
+        segment_samples = int(segment_seconds * sample_rate)
+    else:
+        n_frames = data_cfg.get("n_frames")
+        hop_length = audio_cfg.get("hop_length")
+        if n_frames is not None and hop_length is not None:
+            segment_samples = int(n_frames) * int(hop_length)
+        else:
+            segment_samples = int(data_cfg.get("segment_samples", 256_000))
+
+    if hop_seconds is not None:
+        hop_samples = int(hop_seconds * sample_rate)
+    else:
+        hop_samples = max(1, segment_samples // 2)
+
+    return segment_samples, hop_samples
+
+
+def _mean_metric_dicts(metrics_list: list[dict[str, float]]) -> dict[str, float]:
+    """Average a list of metric dictionaries key-wise."""
+    if not metrics_list:
+        return {}
+
+    keys = metrics_list[0].keys()
+    return {
+        key: float(sum(metrics[key] for metrics in metrics_list) / len(metrics_list))
+        for key in keys
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main evaluation loop
 # ---------------------------------------------------------------------------
@@ -146,7 +186,6 @@ def evaluate(
     """
     from scripts.transcribe import transcribe_full_audio
     from src.metrics import (
-        deduplicate_notes,
         evaluate_transcription,
         instrument_detection_f1,
         macro_average_metrics,
@@ -162,8 +201,12 @@ def evaluate(
     if max_files is not None:
         pairs = pairs[:max_files]
 
-    all_ref: list[dict] = []
-    all_est: list[dict] = []
+    overall_metrics_per_file: list[dict[str, float]] = []
+    instrument_metrics_per_file: list[dict[str, float]] = []
+    per_program_accumulator: dict[int, list[dict[str, float]]] = {}
+    per_program_counts: dict[int, dict[str, int]] = {}
+    num_ref_notes = 0
+    num_est_notes = 0
 
     for idx, (audio_path, notes_path) in enumerate(pairs):
         audio = np.load(audio_path)
@@ -180,8 +223,20 @@ def evaluate(
             device=device,
         )
 
-        all_ref.extend(ref_notes)
-        all_est.extend(est_notes)
+        overall_metrics_per_file.append(evaluate_transcription(ref_notes, est_notes))
+        num_ref_notes += len(ref_notes)
+        num_est_notes += len(est_notes)
+
+        if per_program:
+            file_prog_metrics = per_program_metrics(ref_notes, est_notes)
+            for prog, metrics in file_prog_metrics.items():
+                per_program_accumulator.setdefault(prog, []).append(metrics)
+                counts = per_program_counts.setdefault(prog, {"ref": 0, "est": 0})
+                counts["ref"] += sum(1 for note in ref_notes if note["program"] == prog)
+                counts["est"] += sum(1 for note in est_notes if note["program"] == prog)
+            instrument_metrics_per_file.append(
+                instrument_detection_f1(ref_notes, est_notes)
+            )
 
         if (idx + 1) % 10 == 0 or (idx + 1) == len(pairs):
             print(f"  [{idx + 1}/{len(pairs)}] {audio_path.stem}")
@@ -189,22 +244,26 @@ def evaluate(
     # ------------------------------------------------------------------
     # Overall metrics
     # ------------------------------------------------------------------
-    overall = evaluate_transcription(all_ref, all_est)
+    overall = _mean_metric_dicts(overall_metrics_per_file)
     result: dict = {
         "overall": overall,
         "num_files": len(pairs),
-        "num_ref_notes": len(all_ref),
-        "num_est_notes": len(all_est),
+        "num_ref_notes": num_ref_notes,
+        "num_est_notes": num_est_notes,
     }
 
     # ------------------------------------------------------------------
     # Per-program metrics
     # ------------------------------------------------------------------
     if per_program:
-        pp = per_program_metrics(all_ref, all_est)
+        pp = {
+            prog: _mean_metric_dicts(metrics_list)
+            for prog, metrics_list in per_program_accumulator.items()
+        }
         macro = macro_average_metrics(pp)
-        inst_det = instrument_detection_f1(all_ref, all_est)
+        inst_det = _mean_metric_dicts(instrument_metrics_per_file)
         result["per_program"] = pp
+        result["per_program_counts"] = per_program_counts
         result["macro_avg"] = macro
         result["instrument_detection"] = inst_det
 
@@ -239,8 +298,8 @@ def _dry_run_evaluate(model, config: dict, device: torch.device) -> None:
         model,
         audio,
         sample_rate=sample_rate,
-        segment_samples=min(4 * sample_rate, config.get("data", {}).get("segment_samples", 256_000)),
-        hop_samples=min(2 * sample_rate, 128_000),
+        segment_samples=min(4 * sample_rate, _resolve_window_sizes(config, None, None)[0]),
+        hop_samples=min(2 * sample_rate, _resolve_window_sizes(config, None, None)[1]),
         max_len=64,
         temperature=0.0,
         device=device,
@@ -302,13 +361,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--segment-seconds",
         type=float,
-        default=16.0,
+        default=None,
         help="Segment length in seconds for sliding-window inference.",
     )
     parser.add_argument(
         "--hop-seconds",
         type=float,
-        default=8.0,
+        default=None,
         help="Hop between consecutive segments in seconds.",
     )
     parser.add_argument(
@@ -353,8 +412,9 @@ def main(argv: list[str] | None = None) -> None:
         config = yaml.safe_load(fh)
 
     sample_rate: int = config.get("data", {}).get("sample_rate", 16000)
-    segment_samples = int(args.segment_seconds * sample_rate)
-    hop_samples = int(args.hop_seconds * sample_rate)
+    segment_samples, hop_samples = _resolve_window_sizes(
+        config, args.segment_seconds, args.hop_seconds
+    )
 
     # ------------------------------------------------------------------
     # Model
@@ -436,11 +496,14 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  {'program':<10s}  {'onset F1':>10s}  {'on+off F1':>10s}  {'# ref':>6s}  {'# est':>6s}")
         print("  " + "-" * 46)
         pp = results["per_program"]
+        counts = results.get("per_program_counts", {})
         for prog in sorted(pp.keys()):
             m = pp[prog]
-            n_ref = sum(1 for n in results.get("_ref_notes_all", []) if n["program"] == prog)
+            prog_counts = counts.get(prog, {"ref": 0, "est": 0})
             print(
-                f"  {prog:<10d}  {m['onset_F1'] * 100:>9.2f}%  {m['onset_offset_F1'] * 100:>9.2f}%"
+                f"  {prog:<10d}  {m['onset_F1'] * 100:>9.2f}%  "
+                f"{m['onset_offset_F1'] * 100:>9.2f}%  "
+                f"{prog_counts['ref']:>6d}  {prog_counts['est']:>6d}"
             )
 
     print("=" * 60)
