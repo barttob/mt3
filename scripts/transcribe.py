@@ -2,19 +2,19 @@
 
 Usage
 -----
-    python scripts/transcribe.py \\
-        --audio input.wav \\
-        --output output.mid \\
-        --checkpoint checkpoints/best.pt \\
+    python scripts/transcribe.py \
+        --audio input.wav \
+        --output output.mid \
+        --checkpoint checkpoints/best.pt \
         --config configs/maestro_piano.yaml
 
     # With temperature sampling and custom max token length
-    python scripts/transcribe.py \\
-        --audio input.wav \\
-        --output output.mid \\
-        --checkpoint checkpoints/step_100000.pt \\
-        --config configs/maestro_piano.yaml \\
-        --temperature 0.05 \\
+    python scripts/transcribe.py \
+        --audio input.wav \
+        --output output.mid \
+        --checkpoint checkpoints/step_100000.pt \
+        --config configs/maestro_piano.yaml \
+        --temperature 0.05 \
         --max-len 1024
 
 The script uses a sliding-window approach (segment_samples long, hop_samples

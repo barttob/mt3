@@ -41,4 +41,6 @@ training:
   log_every: 100
   save_every: 10000
   eval_every: 10000
+  patience: 10                     # early stopping after 10 evals without improvement
+  num_workers: 4
   fp16: true

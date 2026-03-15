@@ -3,22 +3,22 @@ and report onset / onset+offset F1 scores (+ per-program for multi-instrument).
 
 Usage
 -----
-    python scripts/evaluate.py \\
-        --checkpoint checkpoints/best.pt \\
-        --config configs/maestro_piano.yaml \\
+    python scripts/evaluate.py \
+        --checkpoint checkpoints/best.pt \
+        --config configs/maestro_piano.yaml \
         --split validation
 
     # Multi-instrument with per-program breakdown
-    python scripts/evaluate.py \\
-        --checkpoint checkpoints/slakh_step_200000.pt \\
-        --config configs/slakh_multi.yaml \\
-        --split test \\
+    python scripts/evaluate.py \
+        --checkpoint checkpoints/slakh_step_200000.pt \
+        --config configs/slakh_multi.yaml \
+        --split test \
         --per-program
 
     # Quick dry-run (synthetic data, no real audio needed)
-    python scripts/evaluate.py \\
-        --checkpoint checkpoints/best.pt \\
-        --config configs/maestro_piano.yaml \\
+    python scripts/evaluate.py \
+        --checkpoint checkpoints/best.pt \
+        --config configs/maestro_piano.yaml \
         --dry-run
 """
 

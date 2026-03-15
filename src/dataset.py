@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.augmentation import WaveformAugmenter
 from src.tokenizer import MidiTokenizer, NoteEvent, ActiveNote
 
 
@@ -40,6 +41,11 @@ class TranscriptionDataset(Dataset):
         tokenizer: :class:`~src.tokenizer.MidiTokenizer` instance that
             controls vocabulary and token format.
         sample_rate: Audio sample rate in Hz (must match the ``.npy`` files).
+        segments_per_file: Number of random segments to draw from each file
+            per epoch.  Higher values improve data utilisation for long
+            audio files (default 10).
+        augmenter: Optional :class:`~src.augmentation.WaveformAugmenter`
+            applied to each waveform segment during training.
         segment_samples: Number of audio samples per training segment.
         max_token_len: Maximum token sequence length (including ``<sos>`` /
             ``<eos>``).  Longer sequences are truncated; shorter ones are
@@ -53,12 +59,16 @@ class TranscriptionDataset(Dataset):
         sample_rate: int = 16_000,
         segment_samples: int = 256_000,
         max_token_len: int = 1024,
+        segments_per_file: int = 10,
+        augmenter: WaveformAugmenter | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
         self.segment_samples = segment_samples
         self.max_token_len = max_token_len
+        self.segments_per_file = segments_per_file
+        self.augmenter = augmenter
 
         self.samples: list[tuple[Path, Path]] = []
         for audio_path in sorted(self.data_dir.glob("*_audio.npy")):
@@ -74,8 +84,8 @@ class TranscriptionDataset(Dataset):
             )
 
     def __len__(self) -> int:
-        """Number of audio files (each yields one random segment per epoch)."""
-        return len(self.samples)
+        """Total segments per epoch (files × segments_per_file)."""
+        return len(self.samples) * self.segments_per_file
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return a (waveform, token_ids) pair for the given file index.
@@ -88,7 +98,8 @@ class TranscriptionDataset(Dataset):
             * ``waveform`` – float32 tensor of shape ``(segment_samples,)``.
             * ``token_ids`` – int64 tensor of shape ``(max_token_len,)``.
         """
-        audio_path, notes_path = self.samples[idx]
+        file_idx = idx % len(self.samples)
+        audio_path, notes_path = self.samples[file_idx]
 
         audio: np.ndarray = np.load(audio_path)
         notes_raw = np.load(notes_path, allow_pickle=True)
@@ -141,6 +152,8 @@ class TranscriptionDataset(Dataset):
             tokens = tokens + [pad_id] * (self.max_token_len - len(tokens))
 
         waveform = torch.tensor(segment, dtype=torch.float32)
+        if self.augmenter is not None:
+            waveform = self.augmenter(waveform)
         token_ids = torch.tensor(tokens, dtype=torch.long)
 
         return waveform, token_ids

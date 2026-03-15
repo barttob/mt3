@@ -61,6 +61,10 @@ class EventDecoder(nn.Module):
         self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
         # Weight tying: share parameters between embedding and output projection
         self.output_proj.weight = self.token_embedding.weight
+        
+        # Initialize token embeddings with scaled variance to account for LayerNorm,
+        # preventing massive initial CE loss from unscaled logits.
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=d_model**-0.5)
 
     def forward(
         self,

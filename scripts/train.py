@@ -27,6 +27,7 @@ import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 
+from src.augmentation import WaveformAugmenter
 from src.dataset import TranscriptionDataset, collate_fn
 from src.model import MT3Model, build_model
 from src.tokenizer import MidiTokenizer
@@ -116,6 +117,7 @@ def _compute_val_loss(
     criterion: nn.CrossEntropyLoss,
     device: torch.device,
     use_amp: bool,
+    amp_dtype: torch.dtype,
     max_batches: int = 50,
 ) -> float:
     """Compute average cross-entropy loss over at most ``max_batches`` val batches."""
@@ -137,7 +139,7 @@ def _compute_val_loss(
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=device)
             tgt_padding_mask = tgt_input == model.tokenizer.special["<pad>"]
 
-            with torch.autocast(device_type=device.type, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 logits = model(waveform, tgt_input, tgt_mask, tgt_padding_mask)
                 loss = criterion(
                     logits.reshape(-1, model.tokenizer.vocab_size),
@@ -193,7 +195,11 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     log_every: int = 1 if dry_run else train_cfg.get("log_every", 100)
     save_every: int = train_cfg.get("save_every", 10_000)
     eval_every: int = train_cfg.get("eval_every", 10_000)
-    use_amp: bool = train_cfg.get("fp16", True) and torch.cuda.is_available()
+    patience: int = train_cfg.get("patience", 10)
+    use_fp16: bool = train_cfg.get("fp16", False) and torch.cuda.is_available()
+    use_bf16: bool = train_cfg.get("bf16", False) and torch.cuda.is_available()
+    use_amp: bool = use_fp16 or use_bf16
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     num_workers: int = 0 if dry_run else train_cfg.get("num_workers", 4)
     max_token_len: int = model_cfg.get("max_token_len", 1024)
 
@@ -201,7 +207,8 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     # Device
     # ------------------------------------------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[train] device={device}  amp={use_amp}  dry_run={dry_run}")
+    amp_mode = ("bf16" if use_bf16 else "fp16") if use_amp else "fp32"
+    print(f"[train] device={device}  amp={amp_mode}  dry_run={dry_run}")
 
     # ------------------------------------------------------------------
     # Model
@@ -226,6 +233,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
         print("[train] dry-run: using synthetic data loaders")
     else:
         sample_rate: int = data_cfg.get("sample_rate", 16_000)
+        augmenter = WaveformAugmenter()
 
         train_ds = TranscriptionDataset(
             data_dir=data_cfg["train_dir"],
@@ -233,6 +241,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
             sample_rate=sample_rate,
             segment_samples=segment_samples,
             max_token_len=max_token_len,
+            augmenter=augmenter,
         )
         train_loader = DataLoader(
             train_ds,
@@ -281,7 +290,8 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
         label_smoothing=label_smoothing,
     )
 
-    scaler = torch.amp.GradScaler(device=device.type, enabled=use_amp)
+    # GradScaler is only needed for fp16; bf16 has fp32-equivalent dynamic range
+    scaler = torch.amp.GradScaler(device=device.type, enabled=use_fp16)
 
     # ------------------------------------------------------------------
     # Checkpointing helpers
@@ -289,20 +299,22 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     ckpt_dir = Path("checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
 
-    def save_checkpoint(step: int) -> None:
+    def save_checkpoint(step: int, is_best: bool = False) -> None:
+        state = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "step": step,
+            "config": config,
+        }
         path = ckpt_dir / f"step_{step}.pt"
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "scaler": scaler.state_dict(),
-                "step": step,
-                "config": config,
-            },
-            path,
-        )
+        torch.save(state, path)
         print(f"[train] checkpoint saved → {path}")
+        if is_best:
+            best_path = ckpt_dir / "best.pt"
+            torch.save(state, best_path)
+            print(f"[train] best checkpoint saved → {best_path}")
 
     # ------------------------------------------------------------------
     # Resume
@@ -330,11 +342,14 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     optimizer.zero_grad()
     accum_loss = 0.0
     accum_steps = 0
+    best_val_loss = float("inf")
+    patience_counter = 0
+    early_stopped = False
 
     print(f"[train] starting at step {global_step}, target {max_steps} steps")
 
     epoch = 0
-    while global_step < max_steps:
+    while global_step < max_steps and not early_stopped:
         epoch += 1
         for waveform, tokens in train_loader:
             if global_step >= max_steps:
@@ -352,7 +367,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
             tgt_padding_mask = tgt_input == model.tokenizer.special["<pad>"]
 
             # Forward pass under autocast
-            with torch.autocast(device_type=device.type, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 logits = model(waveform, tgt_input, tgt_mask, tgt_padding_mask)
                 loss = criterion(
                     logits.reshape(-1, model.tokenizer.vocab_size),
@@ -369,10 +384,19 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
             # Parameter update after accumulating grad_accum micro-batches
             if accum_steps % grad_accum == 0:
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+                # Detect NaN/Inf gradients before stepping
+                grad_ok = torch.isfinite(grad_norm).item()
+                if not grad_ok:
+                    print(f"[train] WARNING: non-finite grad norm at step {global_step + 1}, skipping update")
+
+                scaler.step(optimizer)  # no-op if grad_ok is False (fp16 only)
                 scaler.update()
-                scheduler.step()
+
+                # Only advance scheduler when weights were actually updated
+                if grad_ok:
+                    scheduler.step()
                 optimizer.zero_grad()
 
                 global_step += 1
@@ -395,18 +419,35 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
                 # Validation
                 if val_loader is not None and global_step % eval_every == 0:
                     val_loss = _compute_val_loss(
-                        model, val_loader, criterion, device, use_amp
+                        model, val_loader, criterion, device, use_amp, amp_dtype
                     )
                     print(f"[train] step={global_step:>6d} | val_loss={val_loss:.4f}")
                     if tb_writer is not None:
                         tb_writer.add_scalar("val/loss", val_loss, global_step)
+
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        patience_counter = 0
+                        if not dry_run:
+                            save_checkpoint(global_step, is_best=True)
+                        print(f"[train] new best val_loss={val_loss:.4f}")
+                    else:
+                        patience_counter += 1
+                        print(
+                            f"[train] val_loss did not improve "
+                            f"(patience {patience_counter}/{patience})"
+                        )
+                        if patience_counter >= patience:
+                            print(f"[train] early stopping at step {global_step}")
+                            early_stopped = True
+
                     model.train()
 
                 # Checkpoint
                 if not dry_run and global_step % save_every == 0:
                     save_checkpoint(global_step)
 
-                if global_step >= max_steps:
+                if global_step >= max_steps or early_stopped:
                     break
 
     # Final checkpoint (skip for dry-run)
