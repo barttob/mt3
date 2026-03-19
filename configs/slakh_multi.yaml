@@ -1,5 +1,3 @@
-# Inherits most settings from maestro_piano.yaml, overrides below.
-
 data:
   dataset: slakh
   train_dir: data/processed/slakh/train
@@ -43,4 +41,5 @@ training:
   eval_every: 10000
   patience: 10                     # early stopping after 10 evals without improvement
   num_workers: 4
-  fp16: true
+  fp16: false
+  bf16: true

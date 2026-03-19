@@ -32,8 +32,9 @@ class TranscriptionDataset(Dataset):
       ``onset``, ``offset``, ``pitch``, ``velocity``, ``program``.
 
     At each ``__getitem__`` a contiguous window of ``segment_samples`` samples
-    is drawn uniformly at random, the notes overlapping that window are
-    extracted, and the whole sequence is tokenised with ``tokenizer``.
+    is drawn uniformly at random (or from a fixed deterministic offset when
+    ``random_crop=False``), the notes overlapping that window are extracted,
+    and the whole sequence is tokenised with ``tokenizer``.
 
     Args:
         data_dir: Directory containing the ``*_audio.npy`` / ``*_notes.npy``
@@ -50,6 +51,10 @@ class TranscriptionDataset(Dataset):
         max_token_len: Maximum token sequence length (including ``<sos>`` /
             ``<eos>``).  Longer sequences are truncated; shorter ones are
             right-padded with ``<pad>``.
+        random_crop: If ``True`` (default) the segment start is sampled
+            uniformly at random, giving varied crops across epochs.  Set to
+            ``False`` for validation / evaluation to use a deterministic
+            centre crop so that val-loss numbers are comparable across runs.
     """
 
     def __init__(
@@ -61,6 +66,7 @@ class TranscriptionDataset(Dataset):
         max_token_len: int = 1024,
         segments_per_file: int = 10,
         augmenter: WaveformAugmenter | None = None,
+        random_crop: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.tokenizer = tokenizer
@@ -69,6 +75,7 @@ class TranscriptionDataset(Dataset):
         self.max_token_len = max_token_len
         self.segments_per_file = segments_per_file
         self.augmenter = augmenter
+        self.random_crop = random_crop
 
         self.samples: list[tuple[Path, Path]] = []
         for audio_path in sorted(self.data_dir.glob("*_audio.npy")):
@@ -104,9 +111,12 @@ class TranscriptionDataset(Dataset):
         audio: np.ndarray = np.load(audio_path)
         notes_raw = np.load(notes_path, allow_pickle=True)
 
-        # ---- Random segment window ----------------------------------------
+        # ---- Segment window --------------------------------------------------
         max_start = max(0, len(audio) - self.segment_samples)
-        start_sample = random.randint(0, max_start)
+        if self.random_crop:
+            start_sample = random.randint(0, max_start)
+        else:
+            start_sample = max_start // 2
         end_sample = start_sample + self.segment_samples
         segment = audio[start_sample:end_sample]
 

@@ -7,3 +7,9 @@ runs/
 checkpoints/
 
 *.pt
+*.log
+
+*.wav
+*.flac
+*.mid
+*.midi

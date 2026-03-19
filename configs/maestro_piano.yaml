@@ -27,7 +27,7 @@ tokenizer:
 
 training:
   batch_size: 4                    # per GPU; use gradient accumulation for larger
-  grad_accum_steps: 4              # effective batch = 16
+  grad_accum_steps: 8              # effective batch = 16
   lr: 0.0003                       # peak learning rate
   warmup_steps: 4000
   max_steps: 500000

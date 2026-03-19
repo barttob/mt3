@@ -6,7 +6,7 @@ Usage::
     python scripts/train.py --config configs/maestro_piano.yaml
 
     # Resume from checkpoint
-    python scripts/train.py --config configs/maestro_piano.yaml \\
+    python scripts/train.py --config configs/maestro_piano.yaml \
         --resume checkpoints/step_10000.pt
 
     # Dry-run (2 steps, synthetic data, no disk I/O)
@@ -21,6 +21,8 @@ from pathlib import Path
 
 # Allow ``python scripts/train.py`` from the project root without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import math
 
 import torch
 import torch.nn as nn
@@ -43,13 +45,14 @@ def _load_config(path: str | Path) -> dict:
         return yaml.safe_load(fh)
 
 
-def _make_lr_lambda(warmup_steps: int):
-    """Return a LambdaLR schedule function: linear warm-up then inv-sqrt decay."""
+def _make_lr_lambda(warmup_steps: int, max_steps: int):
+    """Return a LambdaLR schedule function: linear warm-up then cosine decay."""
     def lr_lambda(step: int) -> float:
         step = max(step, 1)
         if step < warmup_steps:
             return step / warmup_steps
-        return (warmup_steps / step) ** 0.5
+        progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
     return lr_lambda
 
 
@@ -67,7 +70,10 @@ def _build_optimizer_and_scheduler(
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        _make_lr_lambda(train_cfg.get("warmup_steps", 4000)),
+        _make_lr_lambda(
+            train_cfg.get("warmup_steps", 4000),
+            train_cfg.get("max_steps", 500_000),
+        ),
     )
     return optimizer, scheduler
 
@@ -118,7 +124,7 @@ def _compute_val_loss(
     device: torch.device,
     use_amp: bool,
     amp_dtype: torch.dtype,
-    max_batches: int = 50,
+    max_batches: int = 200,
 ) -> float:
     """Compute average cross-entropy loss over at most ``max_batches`` val batches."""
     model.eval()
@@ -262,6 +268,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
                 sample_rate=sample_rate,
                 segment_samples=segment_samples,
                 max_token_len=max_token_len,
+                random_crop=False,
             )
             val_loader = DataLoader(
                 val_ds,
