@@ -1,0 +1,54 @@
+# Fine-tuning piano baseline (M0) on Slakh multi-instrument data.
+# Start training with: python scripts/train.py --config configs/slakh_from_piano.yaml \
+#                        --resume checkpoints/mt3_M0_baseline_piano/best.pt
+#
+# NOTE: vocab size grows from 988 (piano-only) to 1117 (multi-instrument).
+# The checkpoint's embedding and output-projection layers need to be resized
+# before loading — ensure the training script handles vocab mismatch gracefully
+# (e.g. random-init the new program-token rows, keep existing rows).
+
+data:
+  dataset: slakh
+  train_dir: data/processed/slakh/train
+  val_dir: data/processed/slakh/validation
+  sample_rate: 16000
+  segment_samples: 32768
+  n_frames: 256
+
+audio:
+  n_fft: 2048
+  hop_length: 128
+  n_mels: 512
+
+model:
+  d_model: 512                       # identical to M0 — weights must match
+  nhead: 8
+  enc_layers: 8
+  dec_layers: 8
+  d_ff: 2048
+  dropout: 0.1
+  max_token_len: 1024
+
+tokenizer:
+  multi_instrument: true             # extends vocab with 129 program tokens
+  num_programs: 129                  # 0-127 MIDI programs + drum ID 128
+  time_step_ms: 8
+  max_time_steps: 600
+
+training:
+  batch_size: 4
+  grad_accum_steps: 8                # effective batch = 32
+  lr: 0.00003                        # 10x lower than scratch — critical for fine-tuning
+  warmup_steps: 1000                 # short warmup; weights already converged
+  max_steps: 150000                  # shorter than scratch (300k) — transfer speeds up learning
+  max_epochs: 200
+  weight_decay: 0.01
+  grad_clip: 1.0
+  label_smoothing: 0.1
+  log_every: 100
+  save_every: 5000
+  eval_every: 5000
+  patience: 10
+  num_workers: 4
+  fp16: false
+  bf16: true

@@ -8,6 +8,11 @@ Usage
         --config configs/maestro_piano.yaml \
         --split validation
 
+    python scripts/evaluate.py \
+        --checkpoint checkpoints/slakh/best.pt \
+        --config configs/slakh_multi.yaml \
+        --split validation
+
     # Multi-instrument with per-program breakdown
     python scripts/evaluate.py \
         --checkpoint checkpoints/slakh_step_200000.pt \

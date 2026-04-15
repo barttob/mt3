@@ -172,6 +172,26 @@ def _try_get_tb_writer(log_dir: str):
         return None
 
 
+def _get_csv_writer(log_path: Path):
+    """Open (or append to) a CSV log file and return (file_handle, csv.DictWriter).
+
+    Args:
+        log_path: Path to the CSV file. Created if it does not exist; appended to
+            if it already exists (supports resume).
+
+    Returns:
+        Tuple of (file_handle, csv.DictWriter).
+    """
+    import csv
+    fieldnames = ["step", "epoch", "train_loss", "lr", "val_loss"]
+    exists = log_path.exists()
+    fh = log_path.open("a", newline="")
+    writer = csv.DictWriter(fh, fieldnames=fieldnames)
+    if not exists:
+        writer.writeheader()
+    return fh, writer
+
+
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
@@ -241,24 +261,52 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
         sample_rate: int = data_cfg.get("sample_rate", 16_000)
         augmenter = WaveformAugmenter()
 
-        train_ds = TranscriptionDataset(
-            data_dir=data_cfg["train_dir"],
-            tokenizer=model.tokenizer,
-            sample_rate=sample_rate,
-            segment_samples=segment_samples,
-            max_token_len=max_token_len,
-            augmenter=augmenter,
-        )
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            collate_fn=collate_fn,
-            pin_memory=device.type == "cuda",
-            drop_last=True,
-            persistent_workers=num_workers > 0,
-        )
+        # Support either a single train_dir or a list of train_dirs with optional weights.
+        train_dirs = data_cfg.get("train_dirs") or [data_cfg["train_dir"]]
+        train_weights = data_cfg.get("train_weights")
+
+        from torch.utils.data import ConcatDataset, WeightedRandomSampler
+
+        datasets = [
+            TranscriptionDataset(
+                data_dir=d,
+                tokenizer=model.tokenizer,
+                sample_rate=sample_rate,
+                segment_samples=segment_samples,
+                max_token_len=max_token_len,
+                augmenter=augmenter,
+            )
+            for d in train_dirs
+        ]
+        train_ds = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+
+        if train_weights and len(datasets) > 1:
+            # Assign a per-sample weight based on which sub-dataset the sample belongs to.
+            sample_weights: list[float] = []
+            for ds, w in zip(datasets, train_weights):
+                sample_weights.extend([w] * len(ds))
+            sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                sampler=sampler,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                pin_memory=device.type == "cuda",
+                drop_last=True,
+                persistent_workers=num_workers > 0,
+            )
+        else:
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                pin_memory=device.type == "cuda",
+                drop_last=True,
+                persistent_workers=num_workers > 0,
+            )
 
         val_dir = data_cfg.get("val_dir")
         if val_dir:
@@ -342,6 +390,13 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     # ------------------------------------------------------------------
     tb_writer = None if dry_run else _try_get_tb_writer("runs/train")
 
+    csv_fh: object = None
+    csv_writer: object = None
+    if not dry_run:
+        csv_log_path = Path("runs/train") / "metrics.csv"
+        csv_log_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_fh, csv_writer = _get_csv_writer(csv_log_path)
+
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
@@ -422,6 +477,15 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
                     if tb_writer is not None:
                         tb_writer.add_scalar("train/loss", avg_micro_loss, global_step)
                         tb_writer.add_scalar("train/lr", current_lr, global_step)
+                    if csv_writer is not None:
+                        csv_writer.writerow({
+                            "step": global_step,
+                            "epoch": epoch,
+                            "train_loss": avg_micro_loss,
+                            "lr": current_lr,
+                            "val_loss": "",
+                        })
+                        csv_fh.flush()
 
                 # Validation
                 if val_loader is not None and global_step % eval_every == 0:
@@ -431,6 +495,15 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
                     print(f"[train] step={global_step:>6d} | val_loss={val_loss:.4f}")
                     if tb_writer is not None:
                         tb_writer.add_scalar("val/loss", val_loss, global_step)
+                    if csv_writer is not None:
+                        csv_writer.writerow({
+                            "step": global_step,
+                            "epoch": epoch,
+                            "train_loss": "",
+                            "lr": current_lr,
+                            "val_loss": val_loss,
+                        })
+                        csv_fh.flush()
 
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
@@ -463,6 +536,8 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
 
     if tb_writer is not None:
         tb_writer.close()
+    if csv_fh is not None:
+        csv_fh.close()
 
     print(f"[train] done. total steps={global_step}")
 

@@ -1,0 +1,53 @@
+# Slakh training with longer audio segments (4.096 s instead of 2.048 s).
+# Hypothesis: denser polyphony in multi-instrument music benefits from
+# a wider temporal window — the encoder sees more co-occurring events,
+# helping the decoder resolve overlapping instruments.
+#
+# Memory impact: sequence length doubles (512 frames vs 256), so batch_size
+# is halved to 2 to keep GPU memory within the same budget as slakh_multi.yaml.
+
+data:
+  dataset: slakh
+  train_dir: data/processed/slakh/train
+  val_dir: data/processed/slakh/validation
+  sample_rate: 16000
+  segment_samples: 65536             # 4.096 s at 16 kHz (512 frames * 128 hop)
+  n_frames: 512                      # double the baseline 256
+
+audio:
+  n_fft: 2048
+  hop_length: 128
+  n_mels: 512
+
+model:
+  d_model: 512
+  nhead: 8
+  enc_layers: 8
+  dec_layers: 8
+  d_ff: 2048
+  dropout: 0.1
+  max_token_len: 1024
+
+tokenizer:
+  multi_instrument: true
+  num_programs: 129                  # 0-127 MIDI programs + drum ID 128
+  time_step_ms: 8
+  max_time_steps: 600
+
+training:
+  batch_size: 2                      # halved vs baseline to compensate for 2x longer sequences
+  grad_accum_steps: 16               # effective batch = 32 (same as slakh_multi)
+  lr: 0.0001
+  warmup_steps: 4000
+  max_steps: 300000
+  max_epochs: 200
+  weight_decay: 0.01
+  grad_clip: 1.0
+  label_smoothing: 0.1
+  log_every: 100
+  save_every: 10000
+  eval_every: 10000
+  patience: 10
+  num_workers: 4
+  fp16: false
+  bf16: true

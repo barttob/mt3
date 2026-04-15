@@ -1,0 +1,61 @@
+# Colab-optimised config for Slakh2100 multi-instrument (small model).
+#
+# Key differences vs slakh_small.yaml:
+#   - fp16 instead of bf16  (T4/V100 don't support bfloat16; only A100+ does)
+#   - paths point to Google Drive  (/content/drive/MyDrive/mt3/...)
+#   - save_every: 2000  (Colab sessions time-out — checkpoint more often)
+#   - num_workers: 2    (Colab CPU quota is limited)
+#   - batch_size: 4 fine for d_model=256 on T4
+#
+# Mount Drive and set paths before training:
+#   from google.colab import drive
+#   drive.mount('/content/drive')
+#
+# Then run:
+#   python scripts/train.py --config configs/colab_slakh_small.yaml
+
+data:
+  dataset: slakh
+  train_dir: /content/drive/MyDrive/mt3/data/processed/slakh/train
+  val_dir: /content/drive/MyDrive/mt3/data/processed/slakh/validation
+  sample_rate: 16000
+  segment_samples: 32768
+  n_frames: 256
+
+audio:
+  n_fft: 2048
+  hop_length: 128
+  n_mels: 512
+
+model:
+  d_model: 256
+  nhead: 4
+  enc_layers: 6
+  dec_layers: 6
+  d_ff: 1024
+  dropout: 0.1
+  max_token_len: 1024
+
+tokenizer:
+  multi_instrument: true
+  num_programs: 129
+  time_step_ms: 8
+  max_time_steps: 600
+
+training:
+  batch_size: 4                    # d_model=256 fits comfortably on T4
+  grad_accum_steps: 8              # effective batch = 32
+  lr: 0.0001
+  warmup_steps: 4000
+  max_steps: 200000
+  max_epochs: 200
+  weight_decay: 0.01
+  grad_clip: 1.0
+  label_smoothing: 0.1
+  log_every: 100
+  save_every: 2000                 # frequent saves — Colab sessions disconnect
+  eval_every: 2000
+  patience: 10
+  num_workers: 2                   # Colab CPU limit
+  fp16: true                       # T4/V100 support fp16 but NOT bf16
+  bf16: false
