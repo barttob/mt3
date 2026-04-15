@@ -113,8 +113,13 @@ def _resolve_window_sizes(
     config: dict,
     segment_seconds: float | None,
     hop_seconds: float | None,
+    overlap: float | None = None,
 ) -> tuple[int, int]:
-    """Resolve evaluation window sizes from config defaults and CLI overrides."""
+    """Resolve evaluation window sizes from config defaults and CLI overrides.
+
+    ``overlap`` (0.0–1.0 exclusive) takes precedence over ``hop_seconds`` when
+    both are provided.
+    """
     data_cfg = config.get("data", {})
     audio_cfg = config.get("audio", {})
     sample_rate = int(data_cfg.get("sample_rate", 16000))
@@ -129,7 +134,11 @@ def _resolve_window_sizes(
         else:
             segment_samples = int(data_cfg.get("segment_samples", 256_000))
 
-    if hop_seconds is not None:
+    if overlap is not None:
+        if not (0.0 < overlap < 1.0):
+            raise ValueError(f"--overlap must be in (0, 1); got {overlap}")
+        hop_samples = max(1, int(segment_samples * (1.0 - overlap)))
+    elif hop_seconds is not None:
         hop_samples = int(hop_seconds * sample_rate)
     else:
         hop_samples = max(1, segment_samples // 2)
@@ -164,6 +173,9 @@ def evaluate(
     per_program: bool = False,
     device: torch.device | None = None,
     max_files: int | None = None,
+    onset_tolerance: float = 0.05,
+    offset_ratio: float = 0.2,
+    offset_min_tolerance: float = 0.05,
 ) -> dict:
     """Run evaluation on all files in ``data_dir``.
 
@@ -183,6 +195,9 @@ def evaluate(
         device: Inference device.
         max_files: If given, evaluate only this many files (useful for quick
             sanity checks).
+        onset_tolerance: Onset tolerance in seconds for mir_eval (default 50 ms).
+        offset_ratio: Offset tolerance as a fraction of note duration (default 0.2).
+        offset_min_tolerance: Minimum offset tolerance in seconds (default 50 ms).
 
     Returns:
         Dict with keys ``overall`` (aggregated metrics), optionally
@@ -228,12 +243,26 @@ def evaluate(
             device=device,
         )
 
-        overall_metrics_per_file.append(evaluate_transcription(ref_notes, est_notes))
+        overall_metrics_per_file.append(
+            evaluate_transcription(
+                ref_notes,
+                est_notes,
+                onset_tolerance=onset_tolerance,
+                offset_ratio=offset_ratio,
+                offset_min_tolerance=offset_min_tolerance,
+            )
+        )
         num_ref_notes += len(ref_notes)
         num_est_notes += len(est_notes)
 
         if per_program:
-            file_prog_metrics = per_program_metrics(ref_notes, est_notes)
+            file_prog_metrics = per_program_metrics(
+                ref_notes,
+                est_notes,
+                onset_tolerance=onset_tolerance,
+                offset_ratio=offset_ratio,
+                offset_min_tolerance=offset_min_tolerance,
+            )
             for prog, metrics in file_prog_metrics.items():
                 per_program_accumulator.setdefault(prog, []).append(metrics)
                 counts = per_program_counts.setdefault(prog, {"ref": 0, "est": 0})
@@ -243,8 +272,14 @@ def evaluate(
                 instrument_detection_f1(ref_notes, est_notes)
             )
 
-        if (idx + 1) % 10 == 0 or (idx + 1) == len(pairs):
-            print(f"  [{idx + 1}/{len(pairs)}] {audio_path.stem}")
+        file_metrics = overall_metrics_per_file[-1]
+        print(
+            f"  [{idx + 1:>{len(str(len(pairs)))}}/{len(pairs)}] "
+            f"{audio_path.stem}  "
+            f"ref={len(ref_notes):4d}  est={len(est_notes):4d}  "
+            f"on_F1={file_metrics['onset_F1'] * 100:5.1f}%  "
+            f"on+off_F1={file_metrics['onset_offset_F1'] * 100:5.1f}%"
+        )
 
     # ------------------------------------------------------------------
     # Overall metrics
@@ -303,8 +338,8 @@ def _dry_run_evaluate(model, config: dict, device: torch.device) -> None:
         model,
         audio,
         sample_rate=sample_rate,
-        segment_samples=min(4 * sample_rate, _resolve_window_sizes(config, None, None)[0]),
-        hop_samples=min(2 * sample_rate, _resolve_window_sizes(config, None, None)[1]),
+        segment_samples=min(4 * sample_rate, _resolve_window_sizes(config, None, None, None)[0]),
+        hop_samples=min(2 * sample_rate, _resolve_window_sizes(config, None, None, None)[1]),
         max_len=64,
         temperature=0.0,
         device=device,
@@ -376,10 +411,35 @@ def main(argv: list[str] | None = None) -> None:
         help="Hop between consecutive segments in seconds.",
     )
     parser.add_argument(
+        "--overlap",
+        type=float,
+        default=None,
+        help="Overlap fraction between consecutive segments (0–1 exclusive, e.g. 0.5). "
+             "Takes precedence over --hop-seconds when both are given.",
+    )
+    parser.add_argument(
         "--max-files",
         type=int,
         default=None,
         help="Evaluate only this many files (useful for quick checks).",
+    )
+    parser.add_argument(
+        "--onset-tolerance",
+        type=float,
+        default=0.05,
+        help="Onset tolerance in seconds for mir_eval scoring (default 50 ms).",
+    )
+    parser.add_argument(
+        "--offset-ratio",
+        type=float,
+        default=0.2,
+        help="Offset tolerance as a fraction of note duration for mir_eval (default 0.2).",
+    )
+    parser.add_argument(
+        "--offset-min-tolerance",
+        type=float,
+        default=0.05,
+        help="Minimum offset tolerance in seconds regardless of duration (default 50 ms).",
     )
     parser.add_argument(
         "--device",
@@ -418,7 +478,7 @@ def main(argv: list[str] | None = None) -> None:
 
     sample_rate: int = config.get("data", {}).get("sample_rate", 16000)
     segment_samples, hop_samples = _resolve_window_sizes(
-        config, args.segment_seconds, args.hop_seconds
+        config, args.segment_seconds, args.hop_seconds, overlap=args.overlap
     )
 
     # ------------------------------------------------------------------
@@ -470,6 +530,9 @@ def main(argv: list[str] | None = None) -> None:
         per_program=args.per_program,
         device=device,
         max_files=args.max_files,
+        onset_tolerance=args.onset_tolerance,
+        offset_ratio=args.offset_ratio,
+        offset_min_tolerance=args.offset_min_tolerance,
     )
 
     # ------------------------------------------------------------------

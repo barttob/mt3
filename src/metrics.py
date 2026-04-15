@@ -26,6 +26,46 @@ Note = dict  # keys: onset, offset, pitch, velocity, program
 
 
 # ---------------------------------------------------------------------------
+# Note filtering
+# ---------------------------------------------------------------------------
+
+def filter_notes(
+    notes: list[Note],
+    min_duration_s: float = 0.03,
+    drum_program: int = 128,
+    drum_min_duration_s: float = 0.01,
+) -> list[Note]:
+    """Remove spuriously short notes produced by the decoder.
+
+    Notes shorter than ``min_duration_s`` are dropped, with a looser threshold
+    for drum notes (program == ``drum_program``) because drum hits are
+    inherently very short.
+
+    Args:
+        notes: List of note dicts (onset, offset, pitch, velocity, program).
+        min_duration_s: Minimum duration in seconds for non-drum notes
+            (default 30 ms).
+        drum_program: MIDI program number used for drum notes (default 128).
+        drum_min_duration_s: Minimum duration in seconds for drum notes
+            (default 10 ms).
+
+    Returns:
+        Filtered list of note dicts, preserving input order.
+    """
+    kept: list[Note] = []
+    for note in notes:
+        duration = note["offset"] - note["onset"]
+        threshold = (
+            drum_min_duration_s
+            if note.get("program", 0) == drum_program
+            else min_duration_s
+        )
+        if duration >= threshold:
+            kept.append(note)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Note deduplication
 # ---------------------------------------------------------------------------
 
@@ -47,33 +87,42 @@ def deduplicate_notes(notes: list[Note], overlap_s: float = 0.05) -> list[Note]:
     if not notes:
         return []
 
-    # Sort by onset, pitch, program for stable comparison
-    sorted_notes = sorted(notes, key=lambda n: (n["onset"], n["pitch"], n["program"]))
-    kept: list[Note] = []
+    # Sort by onset for a single forward pass.
+    sorted_notes = sorted(
+        notes, key=lambda n: (n["onset"], n["pitch"], n["program"])
+    )
+    drop_indices: set[int] = set()  # indices into sorted_notes to suppress
 
-    for note in sorted_notes:
-        duplicate = False
-        for existing in reversed(kept):
-            # Notes are sorted by onset; once the gap is too large, no earlier
-            # match is possible.
-            if note["onset"] - existing["onset"] > overlap_s:
-                break
-            if (
-                existing["pitch"] == note["pitch"]
-                and existing["program"] == note["program"]
-                and abs(existing["onset"] - note["onset"]) <= overlap_s
-            ):
-                # Keep the one with longer duration
-                if (note["offset"] - note["onset"]) > (
-                    existing["offset"] - existing["onset"]
-                ):
-                    kept.remove(existing)
-                    kept.append(note)
-                duplicate = True
-                break
-        if not duplicate:
-            kept.append(note)
+    # recent[(pitch, program)] = index of the most recent surviving note for
+    # that key.  When a new note arrives within overlap_s of the stored one
+    # they are duplicates; the shorter is dropped.  When the gap exceeds
+    # overlap_s the stored entry is replaced (it can no longer clash).
+    recent: dict[tuple[int, int], int] = {}
 
+    for i, note in enumerate(sorted_notes):
+        key = (note["pitch"], note["program"])
+        onset = note["onset"]
+
+        if key in recent:
+            j = recent[key]
+            prev = sorted_notes[j]
+            if onset - prev["onset"] <= overlap_s:
+                # Duplicate pair: keep whichever note has the longer duration.
+                dur_cur = note["offset"] - onset
+                dur_prev = prev["offset"] - prev["onset"]
+                if dur_cur > dur_prev:
+                    drop_indices.add(j)
+                    recent[key] = i  # current note wins
+                else:
+                    drop_indices.add(i)
+                    # recent[key] stays as j (prev note wins)
+                continue  # skip the fallthrough update below
+
+        # New key, or gap exceeded overlap_s — this note becomes the reference.
+        recent[key] = i
+
+    kept = [n for i, n in enumerate(sorted_notes) if i not in drop_indices]
+    # Already sorted by onset; re-sort to ensure pitch ordering too.
     kept.sort(key=lambda n: (n["onset"], n["pitch"]))
     return kept
 

@@ -109,8 +109,13 @@ def _resolve_window_sizes(
     config: dict,
     segment_seconds: float | None,
     hop_seconds: float | None,
+    overlap: float | None = None,
 ) -> tuple[int, int]:
-    """Resolve inference window sizes from config defaults and CLI overrides."""
+    """Resolve inference window sizes from config defaults and CLI overrides.
+
+    ``overlap`` (0.0–1.0 exclusive) takes precedence over ``hop_seconds`` when
+    both are provided.
+    """
     data_cfg = config.get("data", {})
     audio_cfg = config.get("audio", {})
     sample_rate = int(data_cfg.get("sample_rate", 16000))
@@ -125,7 +130,11 @@ def _resolve_window_sizes(
         else:
             segment_samples = int(data_cfg.get("segment_samples", 256_000))
 
-    if hop_seconds is not None:
+    if overlap is not None:
+        if not (0.0 < overlap < 1.0):
+            raise ValueError(f"--overlap must be in (0, 1); got {overlap}")
+        hop_samples = max(1, int(segment_samples * (1.0 - overlap)))
+    elif hop_seconds is not None:
         hop_samples = int(hop_seconds * sample_rate)
     else:
         hop_samples = max(1, segment_samples // 2)
@@ -142,6 +151,7 @@ def transcribe_full_audio(
     max_len: int = 1024,
     temperature: float = 0.0,
     device: torch.device | None = None,
+    min_duration_ms: float = 30.0,
 ) -> list[dict]:
     """Slide a window across ``audio`` and decode MIDI events.
 
@@ -159,11 +169,14 @@ def transcribe_full_audio(
         temperature: Decoding temperature (0 = greedy).
         device: Torch device to run inference on.  Defaults to the model's
             device.
+        min_duration_ms: Minimum note duration in milliseconds. Notes shorter
+            than this threshold are discarded as likely decoder noise (default
+            30 ms; drum notes use 10 ms regardless of this value).
 
     Returns:
-        Sorted, deduplicated list of note dicts.
+        Sorted, deduplicated, filtered list of note dicts.
     """
-    from src.metrics import deduplicate_notes
+    from src.metrics import deduplicate_notes, filter_notes
 
     if device is None:
         device = next(model.parameters()).device
@@ -215,6 +228,7 @@ def transcribe_full_audio(
         )
 
     all_notes = deduplicate_notes(all_notes)
+    all_notes = filter_notes(all_notes, min_duration_s=min_duration_ms / 1000.0)
     return all_notes
 
 
@@ -277,6 +291,19 @@ def main(argv: list[str] | None = None) -> None:
         help="Hop between consecutive segments in seconds.",
     )
     parser.add_argument(
+        "--overlap",
+        type=float,
+        default=None,
+        help="Overlap fraction between consecutive segments (0–1 exclusive, e.g. 0.5). "
+             "Takes precedence over --hop-seconds when both are given.",
+    )
+    parser.add_argument(
+        "--min-duration-ms",
+        type=float,
+        default=30.0,
+        help="Minimum note duration in ms; shorter notes are discarded (default 30 ms).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -301,7 +328,7 @@ def main(argv: list[str] | None = None) -> None:
 
     sample_rate: int = config.get("data", {}).get("sample_rate", 16000)
     segment_samples, hop_samples = _resolve_window_sizes(
-        config, args.segment_seconds, args.hop_seconds
+        config, args.segment_seconds, args.hop_seconds, overlap=args.overlap
     )
 
     # ------------------------------------------------------------------
@@ -346,6 +373,7 @@ def main(argv: list[str] | None = None) -> None:
         max_len=args.max_len,
         temperature=args.temperature,
         device=device,
+        min_duration_ms=args.min_duration_ms,
     )
     print(f"[transcribe] decoded {len(notes)} notes")
 

@@ -84,7 +84,8 @@ class MT3Model(nn.Module):
         max_len: int = 1024,
         temperature: float = 0.0,
         prompt_tokens: Optional[torch.Tensor | list[int]] = None,
-    ) -> torch.Tensor:
+        return_confidences: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Autoregressive greedy / temperature-sampled decoding.
 
         Encodes the waveform once, then generates tokens one at a time until
@@ -99,10 +100,16 @@ class MT3Model(nn.Module):
                 argmax; positive values sample from the softmax distribution.
             prompt_tokens: Optional decoder prompt. When provided this should
                 already contain ``<sos>`` and any tie-section tokens.
+            return_confidences: If ``True``, also return a float tensor of
+                shape (B, L) containing the max softmax probability at each
+                generated step (prompt positions are filled with ``1.0``).
 
         Returns:
             generated: Token ID tensor of shape (B, L) where L ≤ max_len.
                 Each row starts with ``<sos>``.
+            confidences (only when ``return_confidences=True``): Float tensor
+                of shape (B, L) with per-step max softmax probability.
+                Prompt positions are set to ``1.0``.
         """
         spec = self.frontend(waveform)                              # (B, n_mels, T)
         enc_out = self.encoder(spec)                                # (B, T, d_model)
@@ -114,6 +121,7 @@ class MT3Model(nn.Module):
 
         if prompt_tokens is None:
             generated = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
+            prompt_len = 1
         else:
             generated = torch.as_tensor(prompt_tokens, dtype=torch.long, device=device)
             if generated.ndim == 1:
@@ -126,6 +134,10 @@ class MT3Model(nn.Module):
                 raise ValueError(
                     f"Prompt length {generated.size(1)} exceeds max_len={max_len}."
                 )
+            prompt_len = generated.size(1)
+
+        # Track per-step confidence (max softmax prob) for generated tokens only.
+        step_confidences: list[torch.Tensor] = []  # each (B,)
 
         for _ in range(max_len - generated.size(1)):
             S = generated.size(1)
@@ -133,18 +145,30 @@ class MT3Model(nn.Module):
             logits = self.decoder(generated, enc_out, tgt_mask=tgt_mask)
             next_logits = logits[:, -1, :]  # (B, vocab_size)
 
+            probs = torch.softmax(next_logits, dim=-1)          # (B, vocab_size)
             if temperature <= 0.0:
-                next_token = next_logits.argmax(dim=-1, keepdim=True)  # (B, 1)
+                next_token = probs.argmax(dim=-1, keepdim=True)  # (B, 1)
             else:
-                probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)   # (B, 1)
+                scaled = torch.softmax(next_logits / temperature, dim=-1)
+                next_token = torch.multinomial(scaled, num_samples=1)  # (B, 1)
 
+            step_confidences.append(probs.max(dim=-1).values)   # (B,)
             generated = torch.cat([generated, next_token], dim=1)
 
             if (next_token == eos_id).all():
                 break
 
-        return generated
+        if not return_confidences:
+            return generated
+
+        # Prepend 1.0 confidence for the prompt positions.
+        prompt_conf = torch.ones(B, prompt_len, device=device)
+        if step_confidences:
+            gen_conf = torch.stack(step_confidences, dim=1)      # (B, steps)
+            confidences = torch.cat([prompt_conf, gen_conf], dim=1)
+        else:
+            confidences = prompt_conf
+        return generated, confidences
 
 
 # ---------------------------------------------------------------------------
