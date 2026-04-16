@@ -1,6 +1,9 @@
 """MIDI event tokenizer for MT3-style music transcription.
 
-Token vocabulary layout (IDs):
+Two vocabulary layouts are supported, selected at construction time via
+``use_hierarchical_time``:
+
+Flat layout (default, use_hierarchical_time=False):
     0           <pad>
     1           <sos>
     2           <eos>
@@ -9,7 +12,22 @@ Token vocabulary layout (IDs):
     604 – 731   velocity    (128 values, 0–127)
     732 – 859   note_on     (128 MIDI pitches)
     860 – 987   note_off    (128 MIDI pitches)
-    988 – 1116  program     (129 program IDs incl. drums in multi-instrument mode)
+    988 – 1116  program     (129 program IDs incl. drums; multi-instrument only)
+
+Hierarchical layout (use_hierarchical_time=True, defaults: coarse_step_ms=64, num_coarse=75):
+    0 – 3       special tokens (unchanged)
+    4 – 78      coarse_time_shift  (75 tokens × 64 ms, covers 0–4.736 s)
+    79 – 86     fine_time_shift    (8 tokens × 8 ms, offset within coarse bucket)
+    87 – 214    velocity           (128 values)
+    215 – 342   note_on            (128 MIDI pitches)
+    343 – 470   note_off           (128 MIDI pitches)
+    471 – 599   program            (129 IDs; multi-instrument only)
+
+A time event in hierarchical mode is encoded as two consecutive tokens:
+    coarse_time_shift(c)  fine_time_shift(f)
+representing  c × coarse_step_ms + f × time_step_ms  milliseconds from
+segment start. This reduces the time vocabulary from 600 to 83 tokens (86 %)
+while preserving 8 ms precision over the same 4.8 s range.
 """
 
 from __future__ import annotations
@@ -27,25 +45,27 @@ ActiveNote = tuple[int, int, int]                 # pitch, velocity, program
 class MidiTokenizer:
     """Converts MIDI note events to/from integer token sequences.
 
-    The token vocabulary is fixed at construction time. Two modes are
-    supported:
-
-    * **Piano-only** (``multi_instrument=False``): no program tokens are
-      added; all notes are implicitly assumed to be program 0 (piano).
-    * **Multi-instrument** (``multi_instrument=True``): program tokens are
-      appended to the vocabulary (IDs 988+). By default this includes the
-      dedicated drum ID 128, so there are 129 program tokens.
+    The token vocabulary is fixed at construction time. Two tokenization modes
+    and two instrument modes are supported — see the module docstring for the
+    full vocabulary layout.
 
     Args:
-        time_step_ms: Duration of one time-shift bin in milliseconds.
-        max_time_steps: Number of time-shift bins (covers
-            ``time_step_ms * max_time_steps`` ms of audio per segment).
+        time_step_ms: Duration of one fine time-shift bin in milliseconds.
+        max_time_steps: Number of flat time-shift bins (used only when
+            ``use_hierarchical_time=False``).
         num_velocities: Number of MIDI velocity levels (always 128).
         num_pitches: Number of MIDI pitches (always 128).
         num_programs: Number of program IDs. Slakh-style training should use
             129 to cover MIDI programs 0–127 plus the dedicated drum ID 128.
-        multi_instrument: Whether to include program tokens in the
-            vocabulary and token sequences.
+        multi_instrument: Whether to include program tokens in the vocabulary
+            and token sequences.
+        use_hierarchical_time: If True, encode each timestamp as two
+            consecutive tokens (coarse + fine) instead of one flat token.
+        coarse_step_ms: Size of one coarse time bucket in milliseconds.
+            Must be a multiple of ``time_step_ms``. Ignored when
+            ``use_hierarchical_time=False``.
+        num_coarse: Number of coarse time buckets. Ignored when
+            ``use_hierarchical_time=False``.
     """
 
     def __init__(
@@ -56,6 +76,9 @@ class MidiTokenizer:
         num_pitches: int = 128,
         num_programs: int = 129,
         multi_instrument: bool = False,
+        use_hierarchical_time: bool = False,
+        coarse_step_ms: int = 64,
+        num_coarse: int = 75,
     ) -> None:
         self.time_step_ms = time_step_ms
         self.max_time_steps = max_time_steps
@@ -63,6 +86,11 @@ class MidiTokenizer:
         self.num_pitches = num_pitches
         self.num_programs = num_programs
         self.multi_instrument = multi_instrument
+        self.use_hierarchical_time = use_hierarchical_time
+        self.coarse_step_ms = coarse_step_ms
+        self.num_coarse = num_coarse
+        # Number of fine steps within one coarse bucket
+        self.num_fine: int = coarse_step_ms // time_step_ms
 
         # Special tokens
         self.special: dict[str, int] = {
@@ -74,21 +102,32 @@ class MidiTokenizer:
 
         # Build contiguous vocabulary offsets
         offset = 4
-        self.time_offset: int = offset
-        offset += max_time_steps          # 4 – 603
+
+        if use_hierarchical_time:
+            self.coarse_time_offset: int = offset
+            offset += num_coarse                   # coarse buckets
+            self.fine_time_offset: int = offset
+            offset += self.num_fine                # fine steps per bucket
+            # Alias so external code using time_offset still works for range checks
+            self.time_offset: int = self.coarse_time_offset
+        else:
+            self.time_offset = offset
+            offset += max_time_steps
+            self.coarse_time_offset = -1           # sentinel: unused
+            self.fine_time_offset = -1             # sentinel: unused
 
         self.velocity_offset: int = offset
-        offset += num_velocities          # 604 – 731
+        offset += num_velocities
 
         self.note_on_offset: int = offset
-        offset += num_pitches             # 732 – 859
+        offset += num_pitches
 
         self.note_off_offset: int = offset
-        offset += num_pitches             # 860 – 987
+        offset += num_pitches
 
         if multi_instrument:
             self.program_offset: int = offset
-            offset += num_programs        # 988 – 1116 when num_programs=129
+            offset += num_programs
         else:
             self.program_offset = -1      # sentinel: unused
 
@@ -197,7 +236,17 @@ class MidiTokenizer:
                 self.max_time_steps - 1,
             )
             if time_bin != prev_time_bin:
-                tokens.append(self.time_offset + time_bin)
+                if self.use_hierarchical_time:
+                    delta_ms = time_bin * self.time_step_ms
+                    coarse = min(delta_ms // self.coarse_step_ms, self.num_coarse - 1)
+                    fine = min(
+                        (delta_ms - coarse * self.coarse_step_ms) // self.time_step_ms,
+                        self.num_fine - 1,
+                    )
+                    tokens.append(self.coarse_time_offset + coarse)
+                    tokens.append(self.fine_time_offset + fine)
+                else:
+                    tokens.append(self.time_offset + time_bin)
                 prev_time_bin = time_bin
 
             if etype == "on":
@@ -251,6 +300,7 @@ class MidiTokenizer:
         current_time_s: float = segment_start_s
         current_velocity: int = 64   # sensible default
         current_program: int = 0
+        pending_coarse: int = 0      # coarse bucket waiting for its fine token
 
         in_tie_section: bool = True   # between <sos> and <tie>
         sos_seen: bool = False
@@ -277,11 +327,30 @@ class MidiTokenizer:
                 in_tie_section = False
                 # After <tie>, reset to segment start for event section
                 current_time_s = segment_start_s
+                pending_coarse = 0
                 i += 1
                 continue
 
-            # ---- time_shift (event section only) ------------------------
-            if self.time_offset <= tok < self.time_offset + self.max_time_steps:
+            # ---- Hierarchical time tokens (event section only) ----------
+            if self.use_hierarchical_time:
+                if self.coarse_time_offset <= tok < self.coarse_time_offset + self.num_coarse:
+                    if not in_tie_section:
+                        pending_coarse = tok - self.coarse_time_offset
+                    i += 1
+                    continue
+                if self.fine_time_offset <= tok < self.fine_time_offset + self.num_fine:
+                    if not in_tie_section:
+                        fine = tok - self.fine_time_offset
+                        total_ms = (
+                            pending_coarse * self.coarse_step_ms
+                            + fine * self.time_step_ms
+                        )
+                        current_time_s = segment_start_s + total_ms / 1000.0
+                    i += 1
+                    continue
+
+            # ---- Flat time_shift (event section only) -------------------
+            elif self.time_offset <= tok < self.time_offset + self.max_time_steps:
                 if not in_tie_section:
                     time_bin = tok - self.time_offset
                     current_time_s = segment_start_s + time_bin * self.time_step_ms / 1000.0
@@ -375,8 +444,15 @@ class MidiTokenizer:
             if token_id == val:
                 return name
 
-        if self.time_offset <= token_id < self.time_offset + self.max_time_steps:
-            return f"time_shift({token_id - self.time_offset})"
+        if self.use_hierarchical_time:
+            if self.coarse_time_offset <= token_id < self.coarse_time_offset + self.num_coarse:
+                return f"coarse_time_shift({token_id - self.coarse_time_offset})"
+            if self.fine_time_offset <= token_id < self.fine_time_offset + self.num_fine:
+                return f"fine_time_shift({token_id - self.fine_time_offset})"
+        else:
+            if self.time_offset <= token_id < self.time_offset + self.max_time_steps:
+                return f"time_shift({token_id - self.time_offset})"
+
         if self.velocity_offset <= token_id < self.velocity_offset + self.num_velocities:
             return f"velocity({token_id - self.velocity_offset})"
         if self.note_on_offset <= token_id < self.note_on_offset + self.num_pitches:

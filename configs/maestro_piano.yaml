@@ -19,11 +19,19 @@ model:
   d_ff: 2048
   dropout: 0.1
   max_token_len: 1024
+  # Novel architecture features (toggle independently for ablation studies)
+  use_2d_patches: false             # Feature 3: 2D frequency-time patch encoder
+  patch_f: 64                       # mel bins per patch (n_mels must be divisible)
+  patch_t: 8                        # time frames per patch
+  use_pitch_aware_attention: false  # Feature 2: pitch-conditioned cross-attention
 
 tokenizer:
   multi_instrument: false
   time_step_ms: 8
   max_time_steps: 600
+  use_hierarchical_time: false      # Feature 1: coarse+fine two-token time encoding
+  coarse_step_ms: 64                # coarse bucket size in ms (64 = 8 × time_step_ms)
+  num_coarse: 75                    # number of coarse buckets (covers 4.8 s)
 
 training:
   batch_size: 4                    # per GPU; use gradient accumulation for larger

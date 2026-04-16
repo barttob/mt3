@@ -23,6 +23,7 @@
 14. [Key Design Decisions](#14-key-design-decisions)
 15. [Vocabulary Size Derivation](#15-vocabulary-size-derivation)
 16. [Segment Boundary Handling (Tie Section)](#16-segment-boundary-handling-tie-section)
+17. [Novel Architectural Contributions](#17-novel-architectural-contributions)
 
 ---
 
@@ -58,19 +59,21 @@ Raw waveform  (B, num_samples)
 └─────────────┬───────────────┘
               │
               ▼
-┌─────────────────────────────┐
-│   SpectrogramEncoder        │  bidirectional Transformer encoder
-│   Linear proj + SinPE       │  8 layers, d_model=512, nhead=8
-│   + TransformerEncoderLayer │  output: (B, T_frames, 512)
-└─────────────┬───────────────┘
-              │  encoder hidden states
-              ▼
-┌─────────────────────────────┐
-│   EventDecoder              │  causal (autoregressive) decoder
-│   Token Embed + SinPE       │  8 layers, d_model=512, nhead=8
-│   + TransformerDecoderLayer │  cross-attends to encoder states
-│   + output_proj (tied)      │  output: (B, S, vocab_size)
-└─────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│   SpectrogramEncoder                        │  bidirectional Transformer encoder
+│   [default] Linear proj + 1D SinPE          │  8 layers, d_model=512, nhead=8
+│   [novel]   PatchEmbedding2D + 2D SinPE     │  output: (B, N, 512)
+│   + TransformerEncoderLayer × 8             │  N = T_frames or n_patches
+└─────────────────────┬───────────────────────┘
+                      │  encoder hidden states
+                      ▼
+┌─────────────────────────────────────────────┐
+│   EventDecoder                              │  causal (autoregressive) decoder
+│   Token Embed + 1D SinPE                    │  8 layers, d_model=512, nhead=8
+│   [default] TransformerDecoderLayer × 8     │  cross-attends to encoder states
+│   [novel]   PitchAwareDecoderLayer × 8      │  output: (B, S, vocab_size)
+│   + output_proj (weight-tied)               │
+└─────────────────────────────────────────────┘
               │
               ▼
         MIDI event tokens  →  MidiTokenizer.tokens_to_notes()  →  note list
@@ -127,7 +130,9 @@ The 512-mel configuration is higher resolution than standard speech models (typi
 
 **Module**: `src/tokenizer.py` → `MidiTokenizer`
 
-### Vocabulary Layout
+Two vocabulary layouts are supported, selected by `tokenizer.use_hierarchical_time` in config.
+
+### Layout A — Flat Time (default, `use_hierarchical_time: false`)
 
 The vocabulary is flat and contiguous. All offsets are computed at construction time:
 
@@ -143,18 +148,50 @@ The vocabulary is flat and contiguous. All offsets are computed at construction 
 | 860 – 987 | `note_off(p)` | 128 | Note-off for MIDI pitch 0–127 |
 | 988 – 1116 | `program(g)` | 129 | MIDI program 0–127 + drum ID 128 *(multi-instrument only)* |
 
-### Vocabulary Sizes
+**Vocabulary sizes — flat:**
 
 | Mode | Formula | Total |
 |---|---|---|
 | Piano-only | `4 + 600 + 128 + 128 + 128` | **988** |
 | Multi-instrument | `988 + 129` | **1,117** |
 
-### Time Resolution
+### Layout B — Hierarchical Time (`use_hierarchical_time: true`) *(Novel contribution)*
 
-- 1 time_shift bin = 8 ms (`time_step_ms = 8`)
-- 600 bins cover up to `600 × 8 ms = 4.8 s` (more than the 2.048 s segment)
-- Time is quantized: `bin = floor(t_rel_ms / 8)`, clamped to 599
+Each timestamp is encoded as **two consecutive tokens** — a coarse bucket and a fine offset — instead of one flat token. Default parameters: `coarse_step_ms=64`, `num_coarse=75`.
+
+| Token ID range | Type | Count | Description |
+|---|---|---|---|
+| 0 – 3 | special | 4 | Unchanged |
+| 4 – 78 | `coarse_time_shift(c)` | 75 | Coarse bucket: `c × 64 ms` |
+| 79 – 86 | `fine_time_shift(f)` | 8 | Fine offset: `f × 8 ms` within bucket |
+| 87 – 214 | `velocity(v)` | 128 | MIDI velocity 0–127 |
+| 215 – 342 | `note_on(p)` | 128 | Note-on for MIDI pitch 0–127 |
+| 343 – 470 | `note_off(p)` | 128 | Note-off for MIDI pitch 0–127 |
+| 471 – 599 | `program(g)` | 129 | MIDI program 0–127 + drum ID 128 *(multi-instrument only)* |
+
+A time value of `Δt ms` is encoded as:
+```
+coarse = Δt // 64       (range 0–74)
+fine   = (Δt % 64) // 8 (range 0–7)
+→ tokens: coarse_time_shift(coarse), fine_time_shift(fine)
+```
+
+**Vocabulary sizes — hierarchical:**
+
+| Mode | Formula | Total | vs. flat |
+|---|---|---|---|
+| Piano-only | `4 + 75 + 8 + 128 + 128 + 128` | **471** | −517 (−52%) |
+| Multi-instrument | `471 + 129` | **600** | −517 (−46%) |
+
+**Coverage**: `74 × 64 ms + 7 × 8 ms = 4,792 ms` — identical to the flat layout.
+**Precision**: 8 ms — identical to the flat layout.
+**Sequence length**: +1 token per distinct timestamp (2 tokens per time event vs. 1).
+
+### Time Resolution (both layouts)
+
+- Fine resolution = 8 ms (`time_step_ms = 8`)
+- Coverage ≥ 4.8 s (longer than the 2.048 s training segment)
+- Time is quantized: onset/offset times are rounded to the nearest 8 ms bin
 
 ### Event Sequence Grammar
 
@@ -185,22 +222,56 @@ Within each segment the token sequence follows a strict grammar:
 
 ## 5. Spectrogram Encoder
 
-**Module**: `src/encoder.py` → `SpectrogramEncoder`
+**Module**: `src/encoder.py` → `SpectrogramEncoder`, `PatchEmbedding2D`
 
-### Architecture
+Two input embedding modes are supported, selected by `model.use_2d_patches` in config. The Transformer stack (8 pre-LN layers) is identical in both modes.
+
+### Mode A — Per-Frame Projection (default, `use_2d_patches: false`)
 
 ```
 log_mel (B, 512, T)
     → transpose → (B, T, 512)
-    → Linear(512, d_model=512)     # per-frame projection
-    → SinusoidalPositionalEncoding
+    → Linear(512, d_model=512)       # per-frame linear projection
+    → SinusoidalPositionalEncoding   # 1D time PE
     → Dropout(0.1)
     → TransformerEncoder (8 layers, pre-LN)
     → LayerNorm(d_model)
     → enc_out (B, T, 512)
 ```
 
-### Per-Layer Structure (Pre-LayerNorm = T5 convention)
+### Mode B — 2D Frequency-Time Patch Encoder (`use_2d_patches: true`) *(Novel contribution)*
+
+Inspired by Vision Transformers (Dosovitskiy et al., 2021), the spectrogram is divided into non-overlapping 2D patches of size `(patch_f × patch_t)`. Each patch spans multiple mel bins **and** multiple time frames, giving the encoder explicit pitch-band positional awareness through a 2D positional encoding.
+
+```
+log_mel (B, 512, T)
+    → PatchEmbedding2D(patch_f=64, patch_t=8)
+        ├─ reshape into (B, n_fp=8, n_tp=32, patch_f×patch_t=512)
+        ├─ Linear(patch_f×patch_t, d_model)    # patch projection
+        └─ add 2D PE:
+             time_PE[i_t]: sinusoidal, dim d_model//2, encodes time patch index
+             freq_PE[i_f]: sinusoidal, dim d_model//2, encodes frequency band index
+             PE(i_f, i_t) = concat(time_PE[i_t], freq_PE[i_f])
+    → flatten to (B, n_fp × n_tp = 256, d_model)
+    → Dropout(0.1)
+    → TransformerEncoder (8 layers, pre-LN)   # unchanged from Mode A
+    → LayerNorm(d_model)
+    → enc_out (B, 256, 512)
+```
+
+**Default patch dimensions** (`n_mels=512`, `n_frames=256`):
+
+| Parameter | Value | Result |
+|---|---|---|
+| `patch_f` | 64 | `512/64 = 8` frequency patches |
+| `patch_t` | 8 | `256/8 = 32` time patches |
+| Total patches | 256 | Identical sequence length to Mode A |
+
+Each frequency patch covers approximately one octave of the piano range. The 2D PE encodes both *when* (time patch index) and *at what pitch band* (frequency patch index) each patch originates, information unavailable in the flat 1D encoding.
+
+**Note on torchaudio framing**: `torchaudio.MelSpectrogram` with `center=True` (default) produces `T = N/hop + 1` frames. The encoder trims `spec[:, :, :T_trimmed]` where `T_trimmed = (T // patch_t) × patch_t` before patch extraction to handle the extra frame.
+
+### Per-Layer Structure (Pre-LayerNorm = T5 convention, both modes)
 
 Each `TransformerEncoderLayer` with `norm_first=True`:
 
@@ -209,62 +280,99 @@ x → LayerNorm → MultiHeadSelfAttention(nhead=8) → Dropout → residual
   → LayerNorm → FFN(d_model→d_ff=2048→d_model) → Dropout → residual
 ```
 
-### Positional Encoding
+### Positional Encoding — 1D (Mode A)
 
 Fixed sinusoidal encoding (Vaswani et al., 2017):
-
 ```
 PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
 PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
 ```
 
-Precomputed up to `max_len=2048`, stored as a non-trainable buffer. Added directly to the projected frame embeddings.
+### Positional Encoding — 2D (Mode B)
 
-### Key Properties
+Two independent sinusoidal encodings of dimension `d_model//2` each:
+```
+time_PE(t, 2i)   = sin(t / 10000^(2i / (d_model/2)))
+freq_PE(f, 2i)   = sin(f / 10000^(2i / (d_model/2)))
+PE(t, f) = concat(time_PE(t), freq_PE(f))   → d_model
+```
 
-- **No causal mask**: the encoder is bidirectional (full self-attention over all T frames)
-- **Activation**: GELU (smoother gradient than ReLU, empirically preferred in Transformer LM)
-- **Pre-norm**: LayerNorm applied *before* each sub-layer (as in T5) rather than after, which improves training stability at the cost of slight implementation complexity
-- **Output**: contextual representation of every spectrogram frame, shape `(B, T, d_model)`
+This factored design ensures the model can independently generalise to unseen time positions (longer audio) and unseen frequency band configurations.
+
+### Key Properties (both modes)
+
+- **No causal mask**: bidirectional (full self-attention over all N tokens)
+- **Activation**: GELU
+- **Pre-norm**: applied before each sub-layer (T5 convention)
+- **Output shape**: `(B, N, d_model)` where N = T (Mode A) or n_fp × n_tp (Mode B)
 
 ### Parameter Count (approximate)
 
-| Component | Parameters |
-|---|---|
-| Input projection (512→512) | 262,656 |
-| Encoder layer × 8 (attn + FFN) | ~12.6 M |
-| Layer norm | ~1,024 |
-| **Total encoder** | **~13 M** |
+| Component | Mode A | Mode B |
+|---|---|---|
+| Input projection | 262,656 (512→512) | 262,144 (512→512) |
+| Encoder layers × 8 | ~12.6 M | ~12.6 M |
+| **Total encoder** | **~13 M** | **~13 M** |
+
+The parameter counts are nearly identical because both modes use the same `d_model` and the same Transformer stack.
 
 ---
 
 ## 6. Autoregressive Event Decoder
 
-**Module**: `src/decoder.py` → `EventDecoder`
+**Module**: `src/decoder.py` → `EventDecoder`, `PitchAwareDecoderLayer`
 
-### Architecture
+Two decoder layer variants are supported, selected by `model.use_pitch_aware_attention` in config. The embedding, positional encoding, output projection, and weight tying are identical in both modes.
+
+### Architecture (both modes)
 
 ```
 tgt_tokens (B, S)
     → Embedding(vocab_size, d_model) × sqrt(d_model)   # scaled embedding
     → SinusoidalPositionalEncoding
     → Dropout(0.1)
-    → TransformerDecoder (8 layers, pre-LN, causal mask)
-        [cross-attends to enc_out (B, T, d_model)]
+    → [8 decoder layers — see below]
     → LayerNorm(d_model)
-    → Linear(d_model, vocab_size, bias=False)           # output projection
+    → Linear(d_model, vocab_size, bias=False)           # output projection (weight-tied)
     → logits (B, S, vocab_size)
 ```
 
-### Per-Layer Structure
+### Mode A — Standard Decoder (default, `use_pitch_aware_attention: false`)
 
 Each `TransformerDecoderLayer` with `norm_first=True`:
 
 ```
 x → LayerNorm → CausalSelfAttention(nhead=8, tgt_mask=causal) → Dropout → residual
-  → LayerNorm → CrossAttention(nhead=8, key/value=enc_out)     → Dropout → residual
+  → LayerNorm → CrossAttention(nhead=8, Q=x, K/V=enc_out)     → Dropout → residual
   → LayerNorm → FFN(d_model→2048→d_model)                      → Dropout → residual
 ```
+
+### Mode B — Pitch-Aware Decoder (`use_pitch_aware_attention: true`) *(Novel contribution)*
+
+Each `PitchAwareDecoderLayer` is architecturally identical to Mode A **except** that a learned pitch-context embedding is added to the cross-attention query input before the cross-attention sublayer:
+
+```
+x → LayerNorm → CausalSelfAttention(nhead=8, tgt_mask=causal) → Dropout → residual
+  → LayerNorm → x_q = x + pitch_embedding(pitch_ids)           # pitch bias on query
+              → CrossAttention(nhead=8, Q=x_q, K/V=enc_out)   → Dropout → residual
+  → LayerNorm → FFN(d_model→2048→d_model)                      → Dropout → residual
+```
+
+**`pitch_embedding`**: `nn.Embedding(129, d_model)` — one `d_model`-dimensional vector per MIDI pitch (0–127) plus one null embedding at index 128 (initialised to zero, acts as a no-op when no pitch context is available). The null embedding means that positions with no prior `note_on` in the sequence contribute zero bias, making the feature fully backwards-compatible.
+
+**`pitch_ids` tensor** `(B, S)`: at each decoder position `s`, the value is the MIDI pitch of the most recently emitted `note_on` token in the sequence up to position `s`, or 128 if no `note_on` has been seen. Computed by `compute_pitch_context()` in `src/model.py`:
+
+```python
+# Vectorized forward-fill of last note_on pitch
+is_note_on = (tokens >= note_on_offset) & (tokens < note_on_offset + 128)
+pitch_ids = where(is_note_on, tokens - note_on_offset, 128)
+for s in range(1, S):
+    pitch_ids[:, s] = where(pitch_ids[:, s] == 128, pitch_ids[:, s-1], pitch_ids[:, s])
+```
+
+**Intuition**: when the decoder is generating notes around pitch P (e.g., after emitting `velocity(v)` and preparing to emit `note_on(P)` or `note_off(P)`), the cross-attention query is biased toward encoder representations that co-occur with energy at the mel frequency bands corresponding to P. This provides an explicit pitch-frequency inductive bias grounded in music acoustics.
+
+**Extra parameters**: `129 × d_model × 8 layers = 129 × 512 × 8 ≈ 528 K`.
 
 ### Weight Tying
 
@@ -313,7 +421,9 @@ logits = model(waveform, tgt_input, tgt_mask, tgt_padding_mask)
 # logits:           (B, S, vocab_size)
 ```
 
-Internally: `frontend → encoder → decoder`.
+Internally: `frontend → encoder → [compute_pitch_context] → decoder`.
+
+When `use_pitch_aware_attention=True`, `compute_pitch_context(tgt_input, note_on_offset)` is called before the decoder to produce `pitch_ids (B, S)`, which is passed to each `PitchAwareDecoderLayer`.
 
 ### Inference (`transcribe`)
 
@@ -324,7 +434,8 @@ generated = model.transcribe(waveform, max_len=1024, temperature=0.0)
 1. Compute encoder hidden states once (`frontend + encoder`).
 2. Initialize `generated = [[<sos>]]` (or a tie-section prompt).
 3. At each step `t`:
-   - Run decoder on `generated[:t]` → `logits[:, -1, :]`
+   - If `use_pitch_aware_attention`: compute `pitch_ids` from `generated`
+   - Run decoder on `generated[:t]` with optional `pitch_ids` → `logits[:, -1, :]`
    - If `temperature=0.0`: next token = `argmax(logits)` (greedy)
    - If `temperature>0`: next token ~ `Softmax(logits / T)`
    - Append to `generated`
@@ -641,6 +752,13 @@ Each estimated note is matched to a reference note if:
 | `n_frames` | 256 | `data.n_frames` |
 | `time_step_ms` | 8 ms | `tokenizer.time_step_ms` |
 | `max_time_steps` | 600 | `tokenizer.max_time_steps` |
+| `use_hierarchical_time` | `false` | `tokenizer.use_hierarchical_time` |
+| `coarse_step_ms` | 64 ms | `tokenizer.coarse_step_ms` |
+| `num_coarse` | 75 | `tokenizer.num_coarse` |
+| `use_2d_patches` | `false` | `model.use_2d_patches` |
+| `patch_f` | 64 | `model.patch_f` |
+| `patch_t` | 8 | `model.patch_t` |
+| `use_pitch_aware_attention` | `false` | `model.use_pitch_aware_attention` |
 
 ### Piano Config (`maestro_piano.yaml`)
 
@@ -729,9 +847,44 @@ Greedy decoding (`temperature=0.0`) is used in the reference implementation. For
 - Beam search adds significant compute cost at inference time
 - The primary evaluation target is F1, not perplexity or log-likelihood
 
+### 8. Hierarchical Time Tokenization — Why Two Tokens?
+
+The flat 600-token time vocabulary is 61% of the piano vocabulary (600/988). Hierarchical encoding decomposes a timestamp into an independently learnable coarse scale (musical measure/beat level) and fine scale (individual onset timing). Arguments for this design:
+
+- **Vocabulary efficiency**: 83 tokens achieve identical precision and coverage as 600, freeing embedding space for musical structure
+- **Compositional generalisation**: coarse and fine embeddings can each specialise, potentially improving timing precision at inference
+- **Sequence length tradeoff**: each time event costs 2 tokens instead of 1; for typical piano densities (~5 events per 100 ms) this overhead is ~8% of total sequence length
+
+The decomposition mirrors how musicians conceptualise rhythm: at a beat level and a sub-beat subdivision level.
+
+### 9. Pitch-Aware Cross-Attention — Query Bias vs. Other Approaches
+
+The pitch bias is added to the **query** of cross-attention, not to keys or values. This choice is deliberate:
+
+- **Query-side**: changes *what the decoder looks for* in the encoder output — appropriate since pitch determines the frequency band of interest
+- **Key-side**: would change how the encoder output is indexed, but encoder outputs are pitch-agnostic
+- **Value-side**: would change what information is retrieved, but values should remain the full encoder context
+- **Input-side** (before the full layer): would affect both self-attention and cross-attention; less targeted
+
+The null embedding (index 128 = zero vector) means positions before any `note_on` token behave exactly like the standard decoder, ensuring the feature degrades gracefully on non-note tokens.
+
+### 10. 2D Patch Encoder — Sequence Length Preservation
+
+The patch parameters are chosen so that the total number of patches equals the standard encoder sequence length:
+
+```
+n_patches = (n_mels / patch_f) × (T / patch_t)
+          = (512 / 64) × (256 / 8)
+          = 8 × 32 = 256
+```
+
+This means 2D patch mode can be dropped in as a replacement without changing decoder capacity, memory budget, or training schedules. A 2× patch_t (e.g., 16) would halve the sequence length for faster attention at the cost of temporal resolution.
+
 ---
 
 ## 15. Vocabulary Size Derivation
+
+### Flat layout (default)
 
 ```
 Piano-only:
@@ -747,6 +900,35 @@ Multi-instrument adds:
     program:       129   (MIDI 0–127 + drum ID 128)
     ─────────────────────
     total:       1,117
+```
+
+### Hierarchical layout (`use_hierarchical_time: true`)
+
+```
+Piano-only:
+    special tokens:    4   (pad, sos, eos, tie)
+    coarse_time_shift: 75  (0–4.736 s in 64 ms buckets)
+    fine_time_shift:    8  (0–56 ms fine offset in 8 ms steps)
+    velocity:         128   (MIDI 0–127)
+    note_on:          128   (MIDI pitch 0–127)
+    note_off:         128   (MIDI pitch 0–127)
+    ─────────────────────
+    total:            471
+
+Multi-instrument adds:
+    program:          129   (MIDI 0–127 + drum ID 128)
+    ─────────────────────
+    total:            600
+```
+
+Vocabulary reduction: **−517 tokens** regardless of instrument mode (86% reduction in the time sub-vocabulary).
+
+### General formula (hierarchical)
+
+```
+V = 4 + num_coarse + (coarse_step_ms // time_step_ms)
+      + num_velocities + num_pitches + num_pitches
+      [+ num_programs  if multi_instrument]
 ```
 
 The drum ID `128` is a synthetic addition outside the standard MIDI program range (0–127). All drum notes are assigned `program=128` during preprocessing, enabling the model to differentiate pitched instruments from percussion without any special-casing in the decoding logic.
@@ -792,6 +974,100 @@ These tuples are passed to `notes_to_tokens()` to build the tie prefix, ensuring
 
 ---
 
+---
+
+## 17. Novel Architectural Contributions
+
+This section summarises the three architectural innovations introduced beyond the baseline MT3 implementation. All are individually togglable via YAML config for ablation studies.
+
+### Overview
+
+| Feature | Config flag | Files | Baseline comparison |
+|---|---|---|---|
+| Hierarchical Time Tokenization | `tokenizer.use_hierarchical_time` | `src/tokenizer.py` | Flat 600-token time vocab → coarse+fine 83-token scheme |
+| Pitch-Aware Cross-Attention | `model.use_pitch_aware_attention` | `src/decoder.py`, `src/model.py` | Standard cross-attention → pitch-conditioned query bias |
+| 2D Frequency-Time Patch Encoder | `model.use_2d_patches` | `src/encoder.py` | Per-frame 1D projection → 2D patch embedding with frequency PE |
+
+### Feature 1 — Hierarchical Time Tokenization
+
+**Motivation**: The flat time vocabulary is the single largest contributor to vocabulary size (600/988 = 61% of piano vocab). Reducing it should improve the embedding space's capacity for musical structure without losing temporal precision.
+
+**Method**: A two-level coarse/fine decomposition of each timestamp. Coarse tokens encode 64 ms bucket indices; fine tokens encode 8 ms sub-bucket offsets. Both are learned embeddings summed into the decoder's initial representation.
+
+**Expected thesis findings**:
+- Lower perplexity per token (smaller vocab, easier to predict)
+- No degradation in note-level F1 (identical 8 ms precision)
+- Possible improvement in onset precision if fine embedding specialises
+
+**Config to enable**:
+```yaml
+tokenizer:
+  use_hierarchical_time: true
+  coarse_step_ms: 64
+  num_coarse: 75
+```
+
+---
+
+### Feature 2 — Pitch-Aware Cross-Attention
+
+**Motivation**: The decoder's cross-attention has no prior knowledge about which part of the audio spectrum is relevant for the note currently being generated. An explicit pitch-frequency inductive bias could improve note detection precision, particularly for closely-spaced pitches in polyphonic music.
+
+**Method**: A learned `pitch_embedding(129, d_model)` is looked up from the last emitted `note_on` pitch and added to cross-attention queries in every decoder layer at every step. The null embedding (index 128) initialised to zero ensures no bias before the first note.
+
+**Expected thesis findings**:
+- Improved onset-only F1, especially on high-density polyphonic passages
+- Better discrimination between adjacent semitones (e.g., C vs C#)
+- Interpretable attention maps: higher attention on spectrogram frames near the relevant mel frequency
+
+**Config to enable**:
+```yaml
+model:
+  use_pitch_aware_attention: true
+```
+
+---
+
+### Feature 3 — 2D Frequency-Time Patch Encoder
+
+**Motivation**: The standard encoder treats each mel frame as a single `d_model`-dimensional vector, discarding all spatial (frequency-axis) structure within the frame. A 2D patch representation lets the encoder attend across both time and frequency dimensions simultaneously, capturing harmonic relationships that co-occur within a patch.
+
+**Method**: ViT-style 2D patch extraction from the spectrogram. Patches of size `(patch_f=64 × patch_t=8)` are projected to `d_model` with a factored 2D sinusoidal positional encoding (separate time and frequency axes, concatenated).
+
+**Expected thesis findings**:
+- Better multi-pitch detection (harmonic structure visible within patches)
+- Potential improvement on the Slakh multi-instrument task (denser frequency content)
+- Attention pattern analysis: each attention head may specialise to frequency bands
+
+**Config to enable**:
+```yaml
+model:
+  use_2d_patches: true
+  patch_f: 64
+  patch_t: 8
+```
+
+---
+
+### Ablation Experiment Design
+
+To isolate each contribution, run the following configurations against the baseline:
+
+| Experiment | `use_hierarchical_time` | `use_2d_patches` | `use_pitch_aware_attention` |
+|---|---|---|---|
+| Baseline | false | false | false |
+| +F1 only | **true** | false | false |
+| +F2 only | false | false | **true** |
+| +F3 only | false | **true** | false |
+| +F1+F2 | **true** | false | **true** |
+| +F1+F3 | **true** | **true** | false |
+| +F2+F3 | false | **true** | **true** |
+| All features | **true** | **true** | **true** |
+
+Evaluate each on MAESTRO validation using `scripts/evaluate.py`. Report `onset_F1` and `onset_offset_F1`.
+
+---
+
 ## References
 
 1. Gardner, J., Simon, I., Manilow, E., Hawthorne, C., & Engel, J. (2022). **MT3: Multi-Task Multitrack Music Transcription**. *ICLR 2022*.
@@ -813,3 +1089,7 @@ These tuples are passed to `notes_to_tokens()` to build the tie prefix, ensuring
 9. Press, O., & Wolf, L. (2017). **Using the Output Embedding to Improve Language Models**. *EACL 2017*.
 
 10. Loshchilov, I., & Hutter, F. (2019). **Decoupled Weight Decay Regularization (AdamW)**. *ICLR 2019*.
+
+11. Dosovitskiy, A., et al. (2021). **An Image is Worth 16×16 Words: Transformers for Image Recognition at Scale (ViT)**. *ICLR 2021*. *(Inspiration for 2D patch embedding in Feature 3.)*
+
+12. Gong, Y., et al. (2021). **AST: Audio Spectrogram Transformer**. *Interspeech 2021*. *(Application of ViT-style patch encoding to audio spectrograms.)*

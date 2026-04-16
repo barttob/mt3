@@ -20,6 +20,40 @@ from src.frontend import SpectrogramFrontend
 from src.tokenizer import MidiTokenizer
 
 
+def compute_pitch_context(
+    tokens: torch.Tensor, note_on_offset: int
+) -> torch.Tensor:
+    """Compute the MIDI pitch context at each position of a token sequence.
+
+    Returns a tensor of the same shape as ``tokens`` where each entry is the
+    MIDI pitch of the most recent ``note_on`` token seen up to and including
+    that position, or 128 if no ``note_on`` has been seen yet.  Used to
+    supply ``pitch_ids`` to :class:`~src.decoder.PitchAwareDecoderLayer`.
+
+    Args:
+        tokens: Integer token IDs of shape (B, S).
+        note_on_offset: Token ID of ``note_on(0)`` in the vocabulary.
+
+    Returns:
+        Tensor of shape (B, S) with dtype ``torch.long``.
+        Values 0–127 are MIDI pitches; 128 means no pitch context.
+    """
+    is_note_on = (tokens >= note_on_offset) & (tokens < note_on_offset + 128)
+    pitch_ids = torch.where(
+        is_note_on,
+        tokens - note_on_offset,
+        torch.full_like(tokens, 128),
+    )
+    # Forward-fill: carry the last pitch context forward at each position
+    for s in range(1, pitch_ids.shape[1]):
+        pitch_ids[:, s] = torch.where(
+            pitch_ids[:, s] == 128,
+            pitch_ids[:, s - 1],
+            pitch_ids[:, s],
+        )
+    return pitch_ids
+
+
 class MT3Model(nn.Module):
     """Full MT3 encoder-decoder model for music transcription.
 
@@ -72,8 +106,15 @@ class MT3Model(nn.Module):
         """
         spec = self.frontend(waveform)                              # (B, n_mels, T)
         enc_out = self.encoder(spec)                                # (B, T, d_model)
+
+        pitch_ids = None
+        if self.decoder.use_pitch_aware_attention:
+            pitch_ids = compute_pitch_context(
+                tgt_tokens, self.tokenizer.note_on_offset
+            )
+
         logits = self.decoder(
-            tgt_tokens, enc_out, tgt_mask, tgt_padding_mask
+            tgt_tokens, enc_out, pitch_ids, tgt_mask, tgt_padding_mask
         )                                                           # (B, S, vocab_size)
         return logits
 
@@ -142,7 +183,14 @@ class MT3Model(nn.Module):
         for _ in range(max_len - generated.size(1)):
             S = generated.size(1)
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=device)
-            logits = self.decoder(generated, enc_out, tgt_mask=tgt_mask)
+
+            pitch_ids = None
+            if self.decoder.use_pitch_aware_attention:
+                pitch_ids = compute_pitch_context(
+                    generated, self.tokenizer.note_on_offset
+                )
+
+            logits = self.decoder(generated, enc_out, pitch_ids=pitch_ids, tgt_mask=tgt_mask)
             next_logits = logits[:, -1, :]  # (B, vocab_size)
 
             probs = torch.softmax(next_logits, dim=-1)          # (B, vocab_size)
@@ -205,6 +253,9 @@ def build_model(config: Union[str, Path, dict]) -> MT3Model:
             129 if tok_cfg.get("multi_instrument", False) else 128,
         ),
         multi_instrument=tok_cfg.get("multi_instrument", False),
+        use_hierarchical_time=tok_cfg.get("use_hierarchical_time", False),
+        coarse_step_ms=tok_cfg.get("coarse_step_ms", 64),
+        num_coarse=tok_cfg.get("num_coarse", 75),
     )
 
     frontend = SpectrogramFrontend(
@@ -221,6 +272,9 @@ def build_model(config: Union[str, Path, dict]) -> MT3Model:
         num_layers=model_cfg["enc_layers"],
         dim_feedforward=model_cfg["d_ff"],
         dropout=model_cfg["dropout"],
+        use_2d_patches=model_cfg.get("use_2d_patches", False),
+        patch_f=model_cfg.get("patch_f", 64),
+        patch_t=model_cfg.get("patch_t", 8),
     )
 
     decoder = EventDecoder(
@@ -231,6 +285,7 @@ def build_model(config: Union[str, Path, dict]) -> MT3Model:
         dim_feedforward=model_cfg["d_ff"],
         dropout=model_cfg["dropout"],
         max_seq_len=model_cfg["max_token_len"],
+        use_pitch_aware_attention=model_cfg.get("use_pitch_aware_attention", False),
     )
 
     return MT3Model(frontend, encoder, decoder, tokenizer)
