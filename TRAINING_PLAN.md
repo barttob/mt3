@@ -25,10 +25,19 @@
 | S4 | MT3-like | Slakh bez perkusji (300k steps) | 🟢 Opcjonalny | ~2–4 dni | ⬜ |
 | S5 | MT3-like | Slakh→MAESTRO fine-tune (100k steps) | 🟡 Ważny | ~12–24 h | ⬜ |
 | S6 | MT3-like | Slakh+MAESTRO mix fine-tune (100k steps) | 🟡 Ważny | ~12–24 h | ⬜ |
+| N1 | MT3-like | +F1: hierarchical time (200k steps) | 🟡 Ważny | ~2–3 dni | ⬜ |
+| N2 | MT3-like | +F2: pitch-aware attention (200k steps) | 🟡 Ważny | ~2–3 dni | ⬜ |
+| N3 | MT3-like | +F3: 2D patch encoder (200k steps) | 🟡 Ważny | ~2–3 dni | ⬜ |
+| N4 | MT3-like | +F4: RoPE (200k steps) | 🟡 Ważny | ~2–3 dni | ⬜ |
+| N5 | MT3-like | +F5: conv frontend (200k steps) | 🟡 Ważny | ~2–3 dni | ⬜ |
+| N6 | MT3-like | +F2+F4: pitch-aware + RoPE (200k steps) | 🟢 Opcjonalny | ~2–3 dni | ⬜ |
+| N7 | MT3-like | +F4+F5: RoPE + conv (200k steps) | 🟢 Opcjonalny | ~2–3 dni | ⬜ |
+| N8 | MT3-like | **Wszystkie 5 cech** (300k steps) | 🔴 Krytyczny | ~3–5 dni | ⬜ |
 
 **Minimalne wymaganie do obrony:** C0 + M0 (porównanie główne)
 **Pełna ablacja:** C0–C2 + M0–M1
 **Ablacja Slakh:** M3 + S5 + S6 (cross-dataset generalizacja)
+**Ablacja nowatorskich cech:** M0 (baseline 200k) + N1–N5 (izolacja) + N8 (wszystkie)
 
 ---
 
@@ -378,6 +387,187 @@ max_steps:      100000
 
 ---
 
+## MT3-like — Ablacja nowatorskich cech
+
+> Wszystkie runy N* oparte na konfiguracji **maestro_piano.yaml** (MAESTRO v3.0.0, piano-only).
+> Trenowane 200k kroków (N1–N7) lub 300k kroków (N8) — krótszy budżet niż M0 (500k),
+> wystarczający do rzetelnego porównania względnego między konfiguracjami.
+>
+> **Wspólny punkt odniesienia:** M0 wytrenowany 200k kroków (checkpoint `mt3_M0_200k/best.pt`).
+> Dzięki temu wszystkie N* porównywane przy identycznym budżecie treningowym.
+>
+> Cechy (F1–F5) odpowiadają Sekcji 17 PROJECT_REFERENCE.md.
+
+---
+
+### N1 — +F1: Hierarchiczna tokenizacja czasu
+
+> Izoluje wpływ zamiany 600 płaskich tokenów czasu na schemat coarse+fine (83 tokeny).
+> Vocab zmniejsza się: 988 → 471 (piano). Sekwencja wydłuża się ok. ~8% (2 tokeny/zdarzenie).
+
+```yaml
+# Na bazie maestro_piano.yaml z modyfikacją:
+tokenizer:
+  use_hierarchical_time: true
+  coarse_step_ms: 64
+  num_coarse: 75
+
+training:
+  max_steps: 200000
+```
+
+**Checkpoint:** `checkpoints/mt3_N1_hierarchical_time/best.pt`
+**Pytanie badawcze:** Czy mniejszy vocab poprawia jakość przy identycznym budżecie kroków?
+**Uwaga:** vocab_size zmienia się → nie można ładować checkpoint M0 bez resizingu embeddingu.
+
+---
+
+### N2 — +F2: Pitch-Aware Cross-Attention
+
+> Izoluje wpływ embeddingu wysokości nutowej dodawanego do zapytań (query) cross-attention.
+> +528K parametrów (8 warstw × 129 embeddings × 512 d_model).
+
+```yaml
+model:
+  use_pitch_aware_attention: true
+
+training:
+  max_steps: 200000
+```
+
+**Checkpoint:** `checkpoints/mt3_N2_pitch_aware/best.pt`
+**Pytanie badawcze:** Czy bias wysokości nutowej poprawia F1 na gęstej polifonii (akordy)?
+
+---
+
+### N3 — +F3: Enkoder 2D patch
+
+> Izoluje wpływ podziału spektrogramu na 2D patche (patch_f=64, patch_t=8).
+> Sekwencja enkodera: 256 patchy (identyczna długość jak tryb A).
+
+```yaml
+model:
+  use_2d_patches: true
+  patch_f: 64
+  patch_t: 8
+
+training:
+  max_steps: 200000
+```
+
+**Checkpoint:** `checkpoints/mt3_N3_2d_patches/best.pt`
+**Pytanie badawcze:** Czy 2D PE poprawia detekcję harmonicznych współwystępujących w patchu?
+
+---
+
+### N4 — +F4: Rotary Position Embeddings (RoPE)
+
+> Izoluje wpływ zamiany addytywnego PE na RoPE (rotacja Q/K w każdej warstwie self-attention).
+> Zero dodatkowych parametrów. Sinusoidalny PE pomijany w enkoderze i dekoderze.
+
+```yaml
+model:
+  use_rope: true
+
+training:
+  max_steps: 200000
+```
+
+**Checkpoint:** `checkpoints/mt3_N4_rope/best.pt`
+**Pytanie badawcze:** Czy kodowanie względnej pozycji poprawia precyzję timingu onsetów?
+
+---
+
+### N5 — +F5: Konwolucyjny front-end
+
+> Izoluje wpływ zastąpienia projekcji Linear(n_mels, d_model) stosem Conv1d(k=3).
+> +1.57M parametrów (2 bloki Conv1d, n_mels=512→d_model=512).
+
+```yaml
+model:
+  use_conv_frontend: true
+  conv_layers: 2
+
+training:
+  max_steps: 200000
+```
+
+**Checkpoint:** `checkpoints/mt3_N5_conv_frontend/best.pt`
+**Pytanie badawcze:** Czy lokalna receptive field (3 ramki = 24 ms) poprawia F1 dla krótkich nut?
+
+---
+
+### N6 — +F2+F4: Pitch-Aware + RoPE (kombinacja)
+
+> Sprawdza synergię cech po stronie dekodera: RoPE w self-attention + bias wysokości w cross-attention.
+> Oba działają ortogonalnie — RoPE dotyczy self-attention, bias pitch dotyczy cross-attention.
+
+```yaml
+model:
+  use_pitch_aware_attention: true
+  use_rope: true
+
+training:
+  max_steps: 200000
+```
+
+**Checkpoint:** `checkpoints/mt3_N6_pitch_rope/best.pt`
+**Pytanie badawcze:** Czy RoPE + pitch-aware dają efekt addytywny czy synergiczny?
+
+---
+
+### N7 — +F4+F5: RoPE + Konwolucyjny front-end (kombinacja)
+
+> Sprawdza synergię cech po stronie enkodera: lokalny kontekst Conv (F5) + relatywna pozycja RoPE (F4).
+
+```yaml
+model:
+  use_rope: true
+  use_conv_frontend: true
+  conv_layers: 2
+
+training:
+  max_steps: 200000
+```
+
+**Checkpoint:** `checkpoints/mt3_N7_rope_conv/best.pt`
+**Pytanie badawcze:** Czy lokalne wzorce konwolucyjne i relatywna pozycja RoPE uzupełniają się?
+
+---
+
+### N8 — Wszystkie 5 cech (OBOWIĄZKOWY dla rozdziału ablacyjnego)
+
+> Model z włączonymi wszystkimi pięcioma nowatorskimi cechami.
+> Stanowi główny argument pracy — porównanie z M0 pokazuje łączny wkład innowacji.
+> Trening 300k kroków (dłuższy niż N1–N7 bo model ma więcej parametrów i mniejszy vocab).
+
+```yaml
+# Pełna konfiguracja — na bazie maestro_piano.yaml:
+model:
+  use_2d_patches: true
+  patch_f: 64
+  patch_t: 8
+  use_pitch_aware_attention: true
+  use_rope: true
+  use_conv_frontend: true
+  conv_layers: 2
+
+tokenizer:
+  use_hierarchical_time: true
+  coarse_step_ms: 64
+  num_coarse: 75
+
+training:
+  max_steps: 300000
+```
+
+**Checkpoint:** `checkpoints/mt3_N8_all_features/best.pt`
+**Oczekiwane wyniki:** Onset F1 ≥ M0 (cel: ≥ 1–2 pp poprawa nad baseline)
+**Uwaga:** vocab_size=471 (hierarchical piano) — nie można ładować checkpoint M0.
+**Parametry (approx.):** ~28M (+Conv ~1.57M, +PitchEmb ~0.53M, +RoPE ±0)
+
+---
+
 ## Tabela ewaluacyjna (do wypełnienia po treningu)
 
 ### MAESTRO test set (piano, 177 nagrań)
@@ -396,6 +586,22 @@ max_steps:      100000
 | S5 | MT3 Slakh→MAESTRO | 26 | — | — | — | — | — |
 | S6 | MT3 Slakh+MAESTRO mix | 26 | — | — | — | — | — |
 
+### MAESTRO test set — ablacja nowatorskich cech (200k kroków)
+
+> Punkt odniesienia: M0@200k (ten sam config co M0, ale max_steps=200000).
+
+| ID | Cechy włączone | Vocab | Params (M) | Onset F1 | Onset+Off F1 | ΔOnset vs M0@200k |
+|----|---------------|-------|-----------|---------|-------------|-------------------|
+| M0@200k | brak (baseline) | 988 | 26 | — | — | 0 (ref) |
+| N1 | F1: hierarchical time | 471 | ~26 | — | — | — |
+| N2 | F2: pitch-aware attn | 988 | ~26.5 | — | — | — |
+| N3 | F3: 2D patches | 988 | ~26 | — | — | — |
+| N4 | F4: RoPE | 988 | ~26 | — | — | — |
+| N5 | F5: conv frontend | 988 | ~27.6 | — | — | — |
+| N6 | F2+F4 | 988 | ~26.5 | — | — | — |
+| N7 | F4+F5 | 988 | ~27.6 | — | — | — |
+| N8 | F1+F2+F3+F4+F5 (300k) | 471 | ~28 | — | — | — |
+
 ### Slakh test set (multi-instrument)
 
 | ID | Model | Params (M) | Frame F1 | Onset F1 | Onset+Off F1 | RTF | VRAM (MB) |
@@ -413,19 +619,29 @@ max_steps:      100000
 ## Kolejność uruchamiania (zalecana)
 
 ```
-1. C0  ← najważniejszy, uruchom pierwszy
-2. M0  ← uruchom równolegle z C0 jeśli masz 2 GPU, lub po C0
-3. M3  ← Slakh baseline; uruchom równolegle z C0/M0 jeśli dostępne GPU
-4. C1  ← szybki, dobry punkt odniesienia dla C2
-5. C2  ← po C1
-6. M1  ← po M0 (do porównania architektury)
-7. S5  ← po M3 (krótki, ważny wynik cross-dataset)
-8. S6  ← po S5 lub równolegle
-9. C5  ← opcjonalny
-10. C3, C4 ← opcjonalne (razem, bo tanie)
-11. M2  ← opcjonalny
-12. S2  ← po M0 i M3 (wymaga checkpoint M0)
-13. S1, S3, S4 ← opcjonalne Slakh ablacje (od najszybszego)
+1.  C0          ← najważniejszy, uruchom pierwszy
+2.  M0          ← uruchom równolegle z C0 jeśli masz 2 GPU, lub po C0
+3.  M0@200k     ← krótki run M0 (200k steps) — punkt odniesienia dla ablacji N*
+4.  M3          ← Slakh baseline; uruchom równolegle z C0/M0 jeśli dostępne GPU
+5.  C1          ← szybki, dobry punkt odniesienia dla C2
+6.  C2          ← po C1
+7.  M1          ← po M0 (do porównania architektury)
+8.  S5          ← po M3 (krótki, ważny wynik cross-dataset)
+9.  S6          ← po S5 lub równolegle
+──── Ablacje nowatorskich cech (wszystkie po M0@200k) ────
+10. N4          ← RoPE: najtańszy (0 param extra), dobry punkt wyjścia
+11. N5          ← Conv: szybki, izoluje wpływ local context
+12. N2          ← Pitch-aware: izoluje wpływ bias wysokości
+13. N3          ← 2D patches: izoluje wpływ 2D PE
+14. N1          ← Hierarch. time: izoluje wpływ mniejszego vocab (inny vocab_size)
+15. N6, N7      ← pairwise: po N2+N4 i N4+N5
+16. N8          ← wszystkie cechy (300k): ostatni, najdłuższy
+──── Opcjonalne ────
+17. C5          ← opcjonalny CNN
+18. C3, C4      ← opcjonalne (razem, bo tanie)
+19. M2          ← opcjonalny
+20. S2          ← po M0 i M3 (wymaga checkpoint M0)
+21. S1, S3, S4  ← opcjonalne Slakh ablacje (od najszybszego)
 ```
 
 ---
@@ -449,6 +665,16 @@ S5  →  generalizacja cross-dataset (Slakh→MAESTRO)
 S6  →  joint training (Slakh+MAESTRO mix)
 ```
 
+**Jeśli chcesz uwzględnić ablację nowatorskich cech** (Rozdział nowatorski):
+
+```
+M0@200k  →  wspólny punkt odniesienia (identyczny budżet jak N*)
+N1–N5    →  izolacja każdej cechy osobno (5 runów × ~2–3 dni)
+N8       →  wszystkie cechy naraz (wynik finalny, ~3–5 dni)
+```
+
+Minimalne 7 runów dla pełnej ablacji cech: `M0@200k + N1 + N2 + N3 + N4 + N5 + N8`.
+
 ---
 
 ## Notatki techniczne
@@ -457,3 +683,5 @@ S6  →  joint training (Slakh+MAESTRO mix)
 - Po każdym runie zmierzyć RTF na **tym samym** nagraniu testowym (np. pierwsze nagranie z test set)
 - VRAM mierzyć przez `torch.cuda.max_memory_allocated()` podczas inferencji
 - Wyniki wpisywać do tabeli ewaluacyjnej powyżej na bieżąco
+- **N1 i N8**: vocab_size=471 (hierarchical) — nie można restartować od checkpoint M0; trening od zera
+- **N2–N7**: vocab_size=988 — checkpoint M0 można użyć jako warm start (opcjonalnie, skraca trening)

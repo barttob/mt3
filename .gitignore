@@ -13,3 +13,7 @@ checkpoints/
 *.flac
 *.mid
 *.midi
+
+*.zip
+*.tar.gz
+*.rar

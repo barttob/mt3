@@ -222,9 +222,9 @@ Within each segment the token sequence follows a strict grammar:
 
 ## 5. Spectrogram Encoder
 
-**Module**: `src/encoder.py` → `SpectrogramEncoder`, `PatchEmbedding2D`
+**Module**: `src/encoder.py` → `SpectrogramEncoder`, `PatchEmbedding2D`, `ConvFrontend`, `RoPETransformerEncoderLayer`
 
-Two input embedding modes are supported, selected by `model.use_2d_patches` in config. The Transformer stack (8 pre-LN layers) is identical in both modes.
+Three input embedding modes and one orthogonal positional encoding option are supported. The Transformer stack (8 pre-LN layers) is shared across all input modes. Flags are independent and combinable: `use_2d_patches` takes precedence over `use_conv_frontend`; `use_rope` applies to any input mode.
 
 ### Mode A — Per-Frame Projection (default, `use_2d_patches: false`)
 
@@ -271,7 +271,28 @@ Each frequency patch covers approximately one octave of the piano range. The 2D 
 
 **Note on torchaudio framing**: `torchaudio.MelSpectrogram` with `center=True` (default) produces `T = N/hop + 1` frames. The encoder trims `spec[:, :, :T_trimmed]` where `T_trimmed = (T // patch_t) × patch_t` before patch extraction to handle the extra frame.
 
-### Per-Layer Structure (Pre-LayerNorm = T5 convention, both modes)
+### Mode C — Convolutional Front-End (`use_conv_frontend: true`, `use_2d_patches: false`) *(Novel contribution)*
+
+Replaces the single per-frame linear projection with a stack of `Conv1d + GELU` blocks operating along the time axis. Each block has kernel size 3 and padding 1, so stride=1 and sequence length T is preserved.
+
+```
+log_mel (B, 512, T)
+    → ConvFrontend:
+        Conv1d(n_mels=512 → d_model=512, k=3, pad=1) → GELU   # block 1
+        Conv1d(d_model → d_model, k=3, pad=1)        → GELU   # block 2 … conv_layers
+    → transpose → (B, T, d_model)
+    → SinusoidalPositionalEncoding                              # unless use_rope=True
+    → Dropout(0.1)
+    → TransformerEncoder (8 layers, pre-LN)
+    → LayerNorm(d_model)
+    → enc_out (B, T, d_model)
+```
+
+**Intuition**: the Linear(n_mels, d_model) in Mode A collapses each mel frame independently. A 3-frame receptive field allows the projection to incorporate short temporal context, which is useful for detecting sharp transients (onset attacks, note releases) that span only 1–2 frames (~8–16 ms). The Transformer encoder then handles long-range dependencies globally.
+
+**Interaction with other flags**: when `use_2d_patches=True`, `use_conv_frontend` is silently ignored — `PatchEmbedding2D` provides its own multi-frame projection with `patch_t=8`. Sinusoidal PE is still applied after the conv stack unless `use_rope=True`.
+
+### Per-Layer Structure (Pre-LayerNorm = T5 convention, all input modes)
 
 Each `TransformerEncoderLayer` with `norm_first=True`:
 
@@ -299,7 +320,29 @@ PE(t, f) = concat(time_PE(t), freq_PE(f))   → d_model
 
 This factored design ensures the model can independently generalise to unseen time positions (longer audio) and unseen frequency band configurations.
 
-### Key Properties (both modes)
+### Positional Encoding — RoPE (`use_rope: true`) *(Novel contribution)*
+
+When `use_rope=True` the sinusoidal additive PE is **not** applied. Instead, each `RoPETransformerEncoderLayer` rotates the query and key vectors inside every self-attention head:
+
+```
+For sequence position t, head dimension index i, head_dim = d_model / nhead:
+  freq_i   = 1 / 10000^(2i / head_dim)
+  cos_t[i] = cos(t · freq_i)
+  sin_t[i] = sin(t · freq_i)
+
+  rotate_half(x) = concat([-x₂, x₁])   where x = concat([x₁, x₂]), each half d_model/2
+
+  q_rot = q · cos_t + rotate_half(q) · sin_t
+  k_rot = k · cos_t + rotate_half(k) · sin_t
+```
+
+The attention score `q_rot · k_rot` depends only on the *relative* distance `|t_q − t_k|`, giving each attention head relative-position sensitivity without additional parameters.
+
+**Cross-attention is never rotated**: encoder and decoder positions are independent integer indices; applying the same RoPE to both would erroneously impose encoder-to-decoder position alignment. Cross-attention always uses standard `nn.MultiheadAttention`.
+
+**Compatibility**: RoPE is orthogonal to the input embedding mode. When `use_2d_patches=True`, the 2D patch PE baked into `PatchEmbedding2D` encodes *which* frequency band and time slice each patch originates from; RoPE encodes *sequence position* in the attention inner product. These two forms of positional information are complementary.
+
+### Key Properties (all modes)
 
 - **No causal mask**: bidirectional (full self-attention over all N tokens)
 - **Activation**: GELU
@@ -308,28 +351,37 @@ This factored design ensures the model can independently generalise to unseen ti
 
 ### Parameter Count (approximate)
 
-| Component | Mode A | Mode B |
-|---|---|---|
-| Input projection | 262,656 (512→512) | 262,144 (512→512) |
-| Encoder layers × 8 | ~12.6 M | ~12.6 M |
-| **Total encoder** | **~13 M** | **~13 M** |
+| Component | Mode A (default) | Mode B (2D patches) | Mode C (conv, 2 layers) | RoPE flag |
+|---|---|---|---|---|
+| Input projection / embedding | 262,656 | 262,144 | +1,573,376 (+Conv) | ±0 |
+| Encoder layers × 8 | ~12.6 M | ~12.6 M | ~12.6 M | ±0 |
+| **Total encoder** | **~13 M** | **~13 M** | **~14.6 M** | **±0** |
 
-The parameter counts are nearly identical because both modes use the same `d_model` and the same Transformer stack.
+RoPE adds zero parameters — the cos/sin cache is a registered non-trainable buffer. The convolutional front-end (Mode C, 2 layers, n_mels=512, d_model=512) adds `(512×512×3 + 512) + (512×512×3 + 512) ≈ 1.57 M` parameters.
 
 ---
 
 ## 6. Autoregressive Event Decoder
 
-**Module**: `src/decoder.py` → `EventDecoder`, `PitchAwareDecoderLayer`
+**Module**: `src/decoder.py` → `EventDecoder`, `PitchAwareDecoderLayer`, `RoPETransformerDecoderLayer`
 
-Two decoder layer variants are supported, selected by `model.use_pitch_aware_attention` in config. The embedding, positional encoding, output projection, and weight tying are identical in both modes.
+Two orthogonal flags control the decoder stack: `use_pitch_aware_attention` and `use_rope`. Their four combinations are described below. The embedding, output projection, and weight tying are identical in all modes.
 
-### Architecture (both modes)
+### Decoder Mode Summary
+
+| `use_pitch_aware_attention` | `use_rope` | Layer type | Notes |
+|---|---|---|---|
+| false | false | `nn.TransformerDecoder` | Default |
+| false | true | `RoPETransformerDecoderLayer` ×8 | RoPE self-attn |
+| true | false | `PitchAwareDecoderLayer` ×8 | Pitch-conditioned cross-attn |
+| true | true | `PitchAwareDecoderLayer(use_rope=True)` ×8 | Both |
+
+### Architecture (all modes)
 
 ```
 tgt_tokens (B, S)
     → Embedding(vocab_size, d_model) × sqrt(d_model)   # scaled embedding
-    → SinusoidalPositionalEncoding
+    → SinusoidalPositionalEncoding                      # skipped when use_rope=True
     → Dropout(0.1)
     → [8 decoder layers — see below]
     → LayerNorm(d_model)
@@ -373,6 +425,33 @@ for s in range(1, S):
 **Intuition**: when the decoder is generating notes around pitch P (e.g., after emitting `velocity(v)` and preparing to emit `note_on(P)` or `note_off(P)`), the cross-attention query is biased toward encoder representations that co-occur with energy at the mel frequency bands corresponding to P. This provides an explicit pitch-frequency inductive bias grounded in music acoustics.
 
 **Extra parameters**: `129 × d_model × 8 layers = 129 × 512 × 8 ≈ 528 K`.
+
+### Mode C — RoPE Decoder (`use_rope: true`, `use_pitch_aware_attention: false`) *(Novel contribution)*
+
+Each `RoPETransformerDecoderLayer` replaces the standard causal self-attention with `RoPEMultiheadAttention`. Cross-attention remains a standard `nn.MultiheadAttention`.
+
+```
+x → LayerNorm → RoPE-CausalSelfAttention(nhead=8, tgt_mask=causal) → Dropout → residual
+  → LayerNorm → CrossAttention(nhead=8, Q=x, K/V=enc_out) [standard] → Dropout → residual
+  → LayerNorm → FFN(d_model→2048→d_model)                            → Dropout → residual
+```
+
+**Why cross-attention stays standard**: encoder frame positions (0…T) and decoder token positions (0…S) are independent integer indices. Applying the same angular frequencies to Q vectors drawn from decoder states and K vectors drawn from encoder states would impose an artificial encoder-decoder positional alignment. There is no meaningful notion of "encoder position 5 is close to decoder position 5". Cross-attention therefore uses the original additive-PE-free keys and queries.
+
+Sinusoidal PE is **not** added to the token embeddings when `use_rope=True`: RoPE handles sequence position entirely inside each self-attention sublayer.
+
+### Mode D — Pitch-Aware + RoPE (`use_rope: true`, `use_pitch_aware_attention: true`) *(Novel contribution)*
+
+`PitchAwareDecoderLayer(use_rope=True)` combines both features: the causal self-attention sub-layer uses `RoPEMultiheadAttention`; the cross-attention sub-layer is standard and receives the pitch-biased query `x_q = norm2(x) + pitch_embedding(pitch_ids)`:
+
+```
+x → LayerNorm → RoPE-CausalSelfAttention(nhead=8, tgt_mask=causal)  → Dropout → residual
+  → LayerNorm → x_q = x + pitch_embedding(pitch_ids)
+              → CrossAttention(nhead=8, Q=x_q, K/V=enc_out) [standard] → Dropout → residual
+  → LayerNorm → FFN(d_model→2048→d_model)                               → Dropout → residual
+```
+
+**Extra parameters**: same as Mode B — `≈ 528 K` for the pitch embeddings. RoPE adds zero.
 
 ### Weight Tying
 
@@ -880,6 +959,23 @@ n_patches = (n_mels / patch_f) × (T / patch_t)
 
 This means 2D patch mode can be dropped in as a replacement without changing decoder capacity, memory budget, or training schedules. A 2× patch_t (e.g., 16) would halve the sequence length for faster attention at the cost of temporal resolution.
 
+### 11. RoPE — Why Rotation Rather Than Addition, and Why Not on Cross-Attention
+
+**Rotation vs. addition**: standard sinusoidal PE adds a fixed vector to every token embedding. This means positional information must flow through all subsequent linear transformations and residual connections before influencing attention. RoPE instead encodes position in the inner product: `q_rot · k_rot` = function of relative offset `t_q − t_k` only. This gives each attention head a built-in *relative* distance sense with zero extra parameters.
+
+**Cross-attention exemption**: the cross-attention Q comes from decoder states indexed `0…S−1` and the K/V come from encoder states indexed `0…T−1`. These are independent sequences; position 3 in the decoder (e.g., a `velocity` token) has no meaningful relationship to position 3 in the encoder (e.g., mel frame 3). Applying the same rotational frequencies would impose a spurious alignment. Standard `nn.MultiheadAttention` with no positional encoding on the keys/values is correct for cross-attention.
+
+**Compatibility with 2D patch PE**: `PatchEmbedding2D` bakes positional information into the patch tokens before the encoder layers (encoding *which* freq band and *which* time slice). RoPE inside the attention layers encodes *sequence position* of patches in the post-embedding sequence. These are geometrically orthogonal and complement each other.
+
+### 12. Convolutional Front-End — Local Context Before Global Attention
+
+A `Linear(n_mels, d_model)` at each frame is equivalent to a `Conv1d` with kernel size 1: it has no temporal receptive field and cannot see neighbouring frames. Music note onsets and offsets are transients that span approximately 1–3 frames (8–24 ms) at hop_length=128. A `Conv1d(k=3, pad=1)` stack with stride 1 captures this local context *before* the global self-attention, acting as a learned short-time-frequency feature extractor.
+
+**Interaction hierarchy**:
+1. `use_2d_patches=True` → `use_conv_frontend` ignored (patch projection has `patch_t=8` receptive field).
+2. `use_conv_frontend=True`, `use_2d_patches=False` → Conv stack used; sinusoidal PE still applied (Conv output has no explicit position).
+3. `use_conv_frontend=True`, `use_rope=True` → Conv stack used; sinusoidal PE skipped; RoPE applied inside each encoder layer.
+
 ---
 
 ## 15. Vocabulary Size Derivation
@@ -978,7 +1074,7 @@ These tuples are passed to `notes_to_tokens()` to build the tie prefix, ensuring
 
 ## 17. Novel Architectural Contributions
 
-This section summarises the three architectural innovations introduced beyond the baseline MT3 implementation. All are individually togglable via YAML config for ablation studies.
+This section summarises the five architectural innovations introduced beyond the baseline MT3 implementation. All are individually togglable via YAML config for ablation studies.
 
 ### Overview
 
@@ -987,6 +1083,8 @@ This section summarises the three architectural innovations introduced beyond th
 | Hierarchical Time Tokenization | `tokenizer.use_hierarchical_time` | `src/tokenizer.py` | Flat 600-token time vocab → coarse+fine 83-token scheme |
 | Pitch-Aware Cross-Attention | `model.use_pitch_aware_attention` | `src/decoder.py`, `src/model.py` | Standard cross-attention → pitch-conditioned query bias |
 | 2D Frequency-Time Patch Encoder | `model.use_2d_patches` | `src/encoder.py` | Per-frame 1D projection → 2D patch embedding with frequency PE |
+| Rotary Position Embeddings | `model.use_rope` | `src/encoder.py`, `src/decoder.py` | Sinusoidal additive PE → RoPE rotation inside self-attention |
+| Convolutional Front-End | `model.use_conv_frontend` | `src/encoder.py` | Single-frame Linear(n_mels, d_model) → Conv1d stack with k=3 |
 
 ### Feature 1 — Hierarchical Time Tokenization
 
@@ -1049,20 +1147,71 @@ model:
 
 ---
 
+### Feature 4 — Rotary Position Embeddings
+
+**Motivation**: Fixed sinusoidal PE encodes absolute position as an additive bias on token embeddings. For music transcription the model benefits from *relative* timing sensitivity (e.g., a note that follows another by 3 time-steps vs. 10 time-steps), regardless of where in the segment the pair occurs. RoPE encodes position in the attention inner product directly, making relative distance explicit in every attention layer with zero parameter overhead.
+
+**Method**: `RotaryEmbedding` stores inverse-frequency buffers and lazily builds cos/sin caches. `RoPEMultiheadAttention` projects Q, K, V independently, applies rotation to Q and K, and calls `F.scaled_dot_product_attention`. The same class is reused in both encoder (`RoPETransformerEncoderLayer`) and decoder self-attention (`RoPETransformerDecoderLayer` and `PitchAwareDecoderLayer(use_rope=True)`). Cross-attention always uses standard `nn.MultiheadAttention`.
+
+**Extra parameters**: zero — rotation is parameter-free.
+
+**Config to enable**:
+```yaml
+model:
+  use_rope: true
+```
+
+**Expected thesis findings**:
+- Improved onset timing precision (relative-distance encoding matches music's metric structure)
+- Better generalisation to segment lengths not seen during training
+- Complementary to hierarchical time tokenization: RoPE handles continuous timing; hierarchical time handles vocabulary efficiency
+
+---
+
+### Feature 5 — Convolutional Front-End
+
+**Motivation**: The standard per-frame `Linear(n_mels, d_model)` has a single-frame receptive field. Note onsets and offsets are transients lasting ~8–24 ms (1–3 frames at hop=128). A small convolutional stack with kernel size 3 can learn to detect these transients before the global Transformer encoder, providing richer initial token representations.
+
+**Method**: `ConvFrontend` applies `[Conv1d(in_ch→d_model, k=3, pad=1), GELU] × conv_layers`. Stride=1 preserves sequence length T. First block input channels = `n_mels`; subsequent blocks = `d_model`. Output transposed to `(B, T, d_model)`. Sinusoidal PE is still applied after the conv stack (unless `use_rope=True`). When `use_2d_patches=True`, this flag is silently ignored.
+
+**Extra parameters** (2 layers, n_mels=512, d_model=512):
+```
+Block 1: 512 × 512 × 3 + 512 =  786,944
+Block 2: 512 × 512 × 3 + 512 =  786,944
+Total:                          ≈ 1.57 M
+```
+
+**Config to enable**:
+```yaml
+model:
+  use_conv_frontend: true
+  conv_layers: 2
+```
+
+**Expected thesis findings**:
+- Faster convergence (richer initial spectrogram features entering the Transformer)
+- Improved onset/offset F1 (transient-sensitive front-end)
+- Diminishing returns when combined with `use_2d_patches=True` (both provide multi-frame receptive fields)
+
+---
+
 ### Ablation Experiment Design
 
-To isolate each contribution, run the following configurations against the baseline:
+To isolate each contribution, run the following configurations against the baseline (full 2⁵ = 32 grid is impractical; this table covers single-feature isolations, informative pairings, and the all-features combination):
 
-| Experiment | `use_hierarchical_time` | `use_2d_patches` | `use_pitch_aware_attention` |
-|---|---|---|---|
-| Baseline | false | false | false |
-| +F1 only | **true** | false | false |
-| +F2 only | false | false | **true** |
-| +F3 only | false | **true** | false |
-| +F1+F2 | **true** | false | **true** |
-| +F1+F3 | **true** | **true** | false |
-| +F2+F3 | false | **true** | **true** |
-| All features | **true** | **true** | **true** |
+| Experiment | `use_hierarchical_time` | `use_2d_patches` | `use_pitch_aware_attention` | `use_rope` | `use_conv_frontend` |
+|---|---|---|---|---|---|
+| Baseline | false | false | false | false | false |
+| +F1 only | **true** | false | false | false | false |
+| +F2 only | false | false | **true** | false | false |
+| +F3 only | false | **true** | false | false | false |
+| +F4 only | false | false | false | **true** | false |
+| +F5 only | false | false | false | false | **true** |
+| +F1+F2 | **true** | false | **true** | false | false |
+| +F2+F4 | false | false | **true** | **true** | false |
+| +F3+F5 | false | **true** | false | false | **true** |
+| +F4+F5 | false | false | false | **true** | **true** |
+| All features | **true** | **true** | **true** | **true** | **true** |
 
 Evaluate each on MAESTRO validation using `scripts/evaluate.py`. Report `onset_F1` and `onset_offset_F1`.
 
@@ -1093,3 +1242,5 @@ Evaluate each on MAESTRO validation using `scripts/evaluate.py`. Report `onset_F
 11. Dosovitskiy, A., et al. (2021). **An Image is Worth 16×16 Words: Transformers for Image Recognition at Scale (ViT)**. *ICLR 2021*. *(Inspiration for 2D patch embedding in Feature 3.)*
 
 12. Gong, Y., et al. (2021). **AST: Audio Spectrogram Transformer**. *Interspeech 2021*. *(Application of ViT-style patch encoding to audio spectrograms.)*
+
+13. Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., & Liu, Y. (2021). **RoFormer: Enhanced Transformer with Rotary Position Embedding**. *arXiv:2104.09864*. *(Rotary Position Embeddings used in Feature 4.)*

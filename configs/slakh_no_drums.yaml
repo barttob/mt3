@@ -31,6 +31,9 @@ model:
   patch_f: 64
   patch_t: 8
   use_pitch_aware_attention: false
+  use_rope: false
+  use_conv_frontend: false
+  conv_layers: 2
 
 tokenizer:
   multi_instrument: true

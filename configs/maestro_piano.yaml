@@ -24,6 +24,9 @@ model:
   patch_f: 64                       # mel bins per patch (n_mels must be divisible)
   patch_t: 8                        # time frames per patch
   use_pitch_aware_attention: false  # Feature 2: pitch-conditioned cross-attention
+  use_rope: false                    # Feature 4: rotary position embeddings in self-attention
+  use_conv_frontend: false           # Feature 5: convolutional front-end (replaces linear proj)
+  conv_layers: 2                     # number of Conv1d+GELU blocks (use_conv_frontend only)
 
 tokenizer:
   multi_instrument: false

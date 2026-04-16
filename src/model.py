@@ -275,6 +275,9 @@ def build_model(config: Union[str, Path, dict]) -> MT3Model:
         use_2d_patches=model_cfg.get("use_2d_patches", False),
         patch_f=model_cfg.get("patch_f", 64),
         patch_t=model_cfg.get("patch_t", 8),
+        use_rope=model_cfg.get("use_rope", False),
+        use_conv_frontend=model_cfg.get("use_conv_frontend", False),
+        conv_layers=model_cfg.get("conv_layers", 2),
     )
 
     decoder = EventDecoder(
@@ -286,6 +289,7 @@ def build_model(config: Union[str, Path, dict]) -> MT3Model:
         dropout=model_cfg["dropout"],
         max_seq_len=model_cfg["max_token_len"],
         use_pitch_aware_attention=model_cfg.get("use_pitch_aware_attention", False),
+        use_rope=model_cfg.get("use_rope", False),
     )
 
     return MT3Model(frontend, encoder, decoder, tokenizer)

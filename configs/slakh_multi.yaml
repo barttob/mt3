@@ -19,17 +19,20 @@ model:
   d_ff: 2048
   dropout: 0.1
   max_token_len: 1024
-  use_2d_patches: false
+  use_2d_patches: true
   patch_f: 64
   patch_t: 8
-  use_pitch_aware_attention: false
+  use_pitch_aware_attention: true
+  use_rope: false
+  use_conv_frontend: false
+  conv_layers: 2
 
 tokenizer:
   multi_instrument: true
   num_programs: 129               # 0-127 plus dedicated drum ID 128
   time_step_ms: 8
   max_time_steps: 600
-  use_hierarchical_time: false
+  use_hierarchical_time: true
   coarse_step_ms: 64
   num_coarse: 75
 
