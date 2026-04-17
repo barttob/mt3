@@ -37,8 +37,8 @@ tokenizer:
   num_coarse: 75
 
 training:
-  batch_size: 4                    # multi-instrument sequences are longer
-  grad_accum_steps: 8              # effective batch = 32
+  batch_size: 16                    # multi-instrument sequences are longer
+  grad_accum_steps: 2              # effective batch = 32
   lr: 0.0001                       # slightly lower for fine-tuning from piano
   warmup_steps: 4000
   max_steps: 300000
