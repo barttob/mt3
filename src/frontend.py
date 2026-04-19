@@ -31,6 +31,7 @@ class SpectrogramFrontend(nn.Module):
             power=2.0,
         )
 
+    @torch.compiler.disable
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """Compute log-mel spectrogram from waveform.
 
