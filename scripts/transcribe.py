@@ -152,6 +152,8 @@ def transcribe_full_audio(
     temperature: float = 0.0,
     device: torch.device | None = None,
     min_duration_ms: float = 30.0,
+    beam_size: int = 1,
+    confidence_threshold: float = 0.0,
 ) -> list[dict]:
     """Slide a window across ``audio`` and decode MIDI events.
 
@@ -166,12 +168,16 @@ def transcribe_full_audio(
         segment_samples: Number of samples per inference segment.
         hop_samples: Stride between consecutive segments.
         max_len: Maximum token sequence length per segment.
-        temperature: Decoding temperature (0 = greedy).
+        temperature: Decoding temperature (0 = greedy). Ignored when
+            ``beam_size > 1``.
         device: Torch device to run inference on.  Defaults to the model's
             device.
         min_duration_ms: Minimum note duration in milliseconds. Notes shorter
             than this threshold are discarded as likely decoder noise (default
             30 ms; drum notes use 10 ms regardless of this value).
+        beam_size: Number of beams for beam search (default 1 = greedy).
+        confidence_threshold: Drop note_on tokens whose decoder confidence
+            is below this value (0.0 disables filtering, try 0.2–0.4).
 
     Returns:
         Sorted, deduplicated, filtered list of note dicts.
@@ -186,6 +192,11 @@ def transcribe_full_audio(
     total_samples = len(audio)
     if total_samples == 0:
         return []
+
+    use_conf = confidence_threshold > 0.0
+    note_on_lo = model.tokenizer.note_on_offset
+    note_on_hi = note_on_lo + 128
+    pad_id = model.tokenizer.special["<pad>"]
 
     num_segments = max(1, (total_samples - segment_samples + hop_samples) // hop_samples)
     all_notes: list[dict] = []
@@ -204,13 +215,32 @@ def transcribe_full_audio(
         segment_start_s = start / sample_rate
         prompt_tokens = model.tokenizer.build_tie_prefix(prev_active)
 
-        token_ids = model.transcribe(
-            waveform,
-            max_len=max_len,
-            temperature=temperature,
-            prompt_tokens=prompt_tokens,
-        )
-        tokens = token_ids[0].cpu().tolist()
+        if use_conf:
+            token_ids, confs = model.transcribe(
+                waveform,
+                max_len=max_len,
+                temperature=temperature,
+                prompt_tokens=prompt_tokens,
+                beam_size=beam_size,
+                return_confidences=True,
+            )
+            tokens = token_ids[0].cpu().tolist()
+            confs_list = confs[0].cpu().tolist()
+            # Replace low-confidence note_on tokens with <pad> so the tokenizer
+            # ignores them, reducing spurious onset false positives.
+            tokens = [
+                pad_id if (note_on_lo <= tok < note_on_hi and c < confidence_threshold) else tok
+                for tok, c in zip(tokens, confs_list)
+            ]
+        else:
+            token_ids = model.transcribe(
+                waveform,
+                max_len=max_len,
+                temperature=temperature,
+                prompt_tokens=prompt_tokens,
+                beam_size=beam_size,
+            )
+            tokens = token_ids[0].cpu().tolist()
 
         segment_notes = model.tokenizer.tokens_to_notes(
             tokens, segment_start_s=segment_start_s
@@ -304,6 +334,19 @@ def main(argv: list[str] | None = None) -> None:
         help="Minimum note duration in ms; shorter notes are discarded (default 30 ms).",
     )
     parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=1,
+        help="Beam search width (default 1 = greedy). Try 3 or 5 for better F1.",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.0,
+        help="Drop note_on tokens with decoder confidence below this value "
+             "(0 = disabled, try 0.2–0.4 to reduce false positives).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -348,6 +391,10 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[transcribe] loading checkpoint {args.checkpoint} …")
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     state = ckpt.get("model", ckpt)  # handle both raw state_dict and wrapped ckpt
+    # torch.compile wraps keys with "_orig_mod." — strip it so checkpoints saved
+    # during compiled training load cleanly into an uncompiled inference model.
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
     model.load_state_dict(state)
     model.to(device)
     model.eval()
@@ -374,6 +421,8 @@ def main(argv: list[str] | None = None) -> None:
         temperature=args.temperature,
         device=device,
         min_duration_ms=args.min_duration_ms,
+        beam_size=args.beam_size,
+        confidence_threshold=args.confidence_threshold,
     )
     print(f"[transcribe] decoded {len(notes)} notes")
 

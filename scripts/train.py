@@ -246,6 +246,14 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] parameters={n_params:,}  vocab_size={model.tokenizer.vocab_size}")
 
+    # torch.compile gives 30-50% throughput gain on A100 via kernel fusion.
+    if torch.cuda.is_available() and not dry_run:
+        try:
+            model = torch.compile(model)
+            print("[train] torch.compile: enabled")
+        except Exception as e:
+            print(f"[train] torch.compile: skipped ({e})")
+
     # ------------------------------------------------------------------
     # Data loaders
     # ------------------------------------------------------------------
@@ -295,6 +303,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
                 pin_memory=device.type == "cuda",
                 drop_last=True,
                 persistent_workers=num_workers > 0,
+                prefetch_factor=2 if num_workers > 0 else None,
             )
         else:
             train_loader = DataLoader(
@@ -306,6 +315,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
                 pin_memory=device.type == "cuda",
                 drop_last=True,
                 persistent_workers=num_workers > 0,
+                prefetch_factor=2 if num_workers > 0 else None,
             )
 
         val_dir = data_cfg.get("val_dir")
@@ -327,6 +337,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
                 pin_memory=device.type == "cuda",
                 drop_last=False,
                 persistent_workers=num_workers > 0,
+                prefetch_factor=2 if num_workers > 0 else None,
             )
         else:
             val_loader = None
@@ -356,7 +367,7 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
 
     def save_checkpoint(step: int, is_best: bool = False) -> None:
         state = {
-            "model": model.state_dict(),
+            "model": {k.removeprefix("_orig_mod."): v for k, v in model.state_dict().items()},
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
@@ -377,7 +388,10 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     global_step = 0
     if resume:
         ckpt = torch.load(resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        model_state = ckpt["model"]
+        if any(k.startswith("_orig_mod.") for k in model_state):
+            model_state = {k.removeprefix("_orig_mod."): v for k, v in model_state.items()}
+        model.load_state_dict(model_state)
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt:
@@ -408,6 +422,11 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     patience_counter = 0
     early_stopped = False
 
+    # Cache causal mask — S is constant for fixed max_token_len, so no need to
+    # reallocate on every batch (saves a CUDA sync each step).
+    _cached_tgt_mask_S: int = -1
+    _cached_tgt_mask: torch.Tensor | None = None
+
     print(f"[train] starting at step {global_step}, target {max_steps} steps")
 
     epoch = 0
@@ -425,7 +444,10 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
             tgt_output = tokens[:, 1:]
 
             S = tgt_input.size(1)
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=device)
+            if S != _cached_tgt_mask_S:
+                _cached_tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=device)
+                _cached_tgt_mask_S = S
+            tgt_mask = _cached_tgt_mask
             tgt_padding_mask = tgt_input == model.tokenizer.special["<pad>"]
 
             # Forward pass under autocast
