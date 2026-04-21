@@ -132,12 +132,16 @@ class TranscriptionDataset(Dataset):
         note_tuples: list[NoteEvent] = []
         prev_active: list[ActiveNote] = []
 
+        num_programs = self.tokenizer.num_programs
         for note in notes_raw:
             onset = float(note["onset"])
             offset = float(note["offset"])
             pitch = int(note["pitch"])
             velocity = int(note["velocity"])
             program = int(note["program"])
+
+            if program >= num_programs:
+                continue
 
             # Note overlaps with segment if it sounds during [start_s, end_s)
             if onset < end_s and offset > start_s:

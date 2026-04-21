@@ -126,8 +126,9 @@ class MT3Model(nn.Module):
         temperature: float = 0.0,
         prompt_tokens: Optional[torch.Tensor | list[int]] = None,
         return_confidences: bool = False,
+        beam_size: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Autoregressive greedy / temperature-sampled decoding.
+        """Autoregressive decoding: greedy, temperature sampling, or beam search.
 
         Encodes the waveform once, then generates tokens one at a time until
         every sequence in the batch has produced ``<eos>`` or ``max_len`` is
@@ -139,11 +140,15 @@ class MT3Model(nn.Module):
                 initial ``<sos>``).
             temperature: Sampling temperature. ``0.0`` (default) uses greedy
                 argmax; positive values sample from the softmax distribution.
+                Ignored when ``beam_size > 1``.
             prompt_tokens: Optional decoder prompt. When provided this should
                 already contain ``<sos>`` and any tie-section tokens.
             return_confidences: If ``True``, also return a float tensor of
                 shape (B, L) containing the max softmax probability at each
                 generated step (prompt positions are filled with ``1.0``).
+            beam_size: Number of beams for beam search. ``1`` (default) uses
+                greedy / temperature decoding. Values > 1 enable beam search
+                and ignore ``temperature``.
 
         Returns:
             generated: Token ID tensor of shape (B, L) where L ≤ max_len.
@@ -152,37 +157,57 @@ class MT3Model(nn.Module):
                 of shape (B, L) with per-step max softmax probability.
                 Prompt positions are set to ``1.0``.
         """
-        spec = self.frontend(waveform)                              # (B, n_mels, T)
-        enc_out = self.encoder(spec)                                # (B, T, d_model)
+        device = waveform.device
+        amp_dtype = (
+            torch.bfloat16
+            if device.type == "cuda" and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"):
+            spec = self.frontend(waveform)                          # (B, n_mels, T)
+            enc_out = self.encoder(spec)                            # (B, T, d_model)
 
         B = enc_out.size(0)
-        device = enc_out.device
         sos_id = self.tokenizer.special["<sos>"]
         eos_id = self.tokenizer.special["<eos>"]
 
+        # Build prompt tensor (B, P)
         if prompt_tokens is None:
-            generated = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
-            prompt_len = 1
+            prompt = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
         else:
-            generated = torch.as_tensor(prompt_tokens, dtype=torch.long, device=device)
-            if generated.ndim == 1:
-                generated = generated.unsqueeze(0).expand(B, -1).clone()
-            elif generated.ndim != 2 or generated.size(0) != B:
+            prompt = torch.as_tensor(prompt_tokens, dtype=torch.long, device=device)
+            if prompt.ndim == 1:
+                prompt = prompt.unsqueeze(0).expand(B, -1).clone()
+            elif prompt.ndim != 2 or prompt.size(0) != B:
                 raise ValueError(
-                    f"prompt_tokens must have shape (P,) or (B, P); got {tuple(generated.shape)}"
+                    f"prompt_tokens must have shape (P,) or (B, P); got {tuple(prompt.shape)}"
                 )
-            if generated.size(1) > max_len:
+            if prompt.size(1) > max_len:
                 raise ValueError(
-                    f"Prompt length {generated.size(1)} exceeds max_len={max_len}."
+                    f"Prompt length {prompt.size(1)} exceeds max_len={max_len}."
                 )
-            prompt_len = generated.size(1)
+
+        if beam_size > 1:
+            return self._beam_search(
+                enc_out, prompt, max_len, beam_size, device, amp_dtype, return_confidences
+            )
+
+        # -----------------------------------------------------------------
+        # Greedy / temperature decoding (beam_size == 1)
+        # -----------------------------------------------------------------
+        generated = prompt
+        prompt_len = generated.size(1)
 
         # Track per-step confidence (max softmax prob) for generated tokens only.
         step_confidences: list[torch.Tensor] = []  # each (B,)
 
+        # Pre-allocate the full causal mask once and slice per step — avoids
+        # O(max_len) separate triu() allocations inside the decode loop.
+        full_mask = nn.Transformer.generate_square_subsequent_mask(max_len, device=device)
+
         for _ in range(max_len - generated.size(1)):
             S = generated.size(1)
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(S, device=device)
+            tgt_mask = full_mask[:S, :S]
 
             pitch_ids = None
             if self.decoder.use_pitch_aware_attention:
@@ -190,14 +215,15 @@ class MT3Model(nn.Module):
                     generated, self.tokenizer.note_on_offset
                 )
 
-            logits = self.decoder(generated, enc_out, pitch_ids=pitch_ids, tgt_mask=tgt_mask)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"):
+                logits = self.decoder(generated, enc_out, pitch_ids=pitch_ids, tgt_mask=tgt_mask)
             next_logits = logits[:, -1, :]  # (B, vocab_size)
 
-            probs = torch.softmax(next_logits, dim=-1)          # (B, vocab_size)
+            probs = torch.softmax(next_logits.float(), dim=-1)  # fp32 for stability
             if temperature <= 0.0:
                 next_token = probs.argmax(dim=-1, keepdim=True)  # (B, 1)
             else:
-                scaled = torch.softmax(next_logits / temperature, dim=-1)
+                scaled = torch.softmax(next_logits.float() / temperature, dim=-1)
                 next_token = torch.multinomial(scaled, num_samples=1)  # (B, 1)
 
             step_confidences.append(probs.max(dim=-1).values)   # (B,)
@@ -217,6 +243,129 @@ class MT3Model(nn.Module):
         else:
             confidences = prompt_conf
         return generated, confidences
+
+    @torch.no_grad()
+    def _beam_search(
+        self,
+        enc_out: torch.Tensor,
+        prompt: torch.Tensor,
+        max_len: int,
+        beam_size: int,
+        device: torch.device,
+        amp_dtype: torch.dtype,
+        return_confidences: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Beam search decoding.
+
+        Args:
+            enc_out: Encoder output of shape (B, T, d_model).
+            prompt: Initial token sequence (B, P) starting with ``<sos>``.
+            max_len: Maximum total sequence length including prompt.
+            beam_size: Number of beams (K).
+            device: Inference device.
+            amp_dtype: dtype for autocast.
+            return_confidences: Whether to return per-token confidence scores.
+
+        Returns:
+            best_seq: (B, L) highest-scoring token sequence per batch item.
+            confidences (optional): (B, L) per-token softmax probability.
+        """
+        B, P = prompt.shape
+        K = beam_size
+        T, d = enc_out.size(1), enc_out.size(2)
+        eos_id = self.tokenizer.special["<eos>"]
+        vocab_size = self.tokenizer.vocab_size
+
+        # Expand encoder output for all beams: (B, T, d) → (B*K, T, d)
+        enc_out_exp = (
+            enc_out.unsqueeze(1)
+                   .expand(-1, K, -1, -1)
+                   .reshape(B * K, T, d)
+        )
+
+        # All K beams start from the same prompt: (B, P) → (B*K, P)
+        beams = prompt.unsqueeze(1).expand(-1, K, -1).reshape(B * K, P).clone()
+
+        # Log-prob scores: (B, K). Only first beam active; rest start at -inf
+        # so diversity is forced from the very first generation step.
+        beam_scores = torch.full((B, K), -float("inf"), device=device)
+        beam_scores[:, 0] = 0.0
+
+        # finished[b, k] = True once beam k of batch b emitted <eos>
+        finished = torch.zeros(B, K, dtype=torch.bool, device=device)
+
+        # Confidence history: (B*K, P) — prompt positions all 1.0
+        beam_conf = torch.ones(B * K, P, device=device)
+
+        full_mask = nn.Transformer.generate_square_subsequent_mask(max_len, device=device)
+
+        for _ in range(max_len - P):
+            S = beams.size(1)
+            tgt_mask = full_mask[:S, :S]
+
+            pitch_ids = None
+            if self.decoder.use_pitch_aware_attention:
+                pitch_ids = compute_pitch_context(beams, self.tokenizer.note_on_offset)
+
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"):
+                logits = self.decoder(beams, enc_out_exp, pitch_ids=pitch_ids, tgt_mask=tgt_mask)
+
+            next_logits = logits[:, -1, :].float()               # (B*K, vocab)
+            log_probs = torch.log_softmax(next_logits, dim=-1)   # (B*K, vocab)
+            log_probs_bkv = log_probs.reshape(B, K, vocab_size)
+
+            # Force finished beams to stay at EOS with zero incremental score
+            if finished.any():
+                log_probs_bkv[finished] = -float("inf")
+                log_probs_bkv[finished, eos_id] = 0.0
+
+            # Candidate scores: beam_scores + next log-prob → (B, K, vocab)
+            candidate_scores = beam_scores.unsqueeze(-1) + log_probs_bkv
+            flat_scores = candidate_scores.reshape(B, K * vocab_size)
+
+            # Top-K candidates per batch item
+            topk_scores, topk_flat = flat_scores.topk(K, dim=-1)  # (B, K)
+            prev_beam_idx = topk_flat // vocab_size                 # (B, K)
+            next_token_id = topk_flat % vocab_size                  # (B, K)
+
+            # Flat indices into (B*K, ...) — maps (b, k) → b*K + prev_beam_idx[b, k]
+            batch_offset = torch.arange(B, device=device).unsqueeze(1) * K
+            global_beam_idx = (batch_offset + prev_beam_idx).reshape(-1)  # (B*K,)
+            next_token_flat = next_token_id.reshape(-1)                    # (B*K,)
+
+            # Per-token confidence: softmax prob of chosen token under parent beam
+            step_conf = log_probs[global_beam_idx, next_token_flat].exp()  # (B*K,)
+
+            # Reorder sequences and conf history to follow parent beams
+            beams = beams[global_beam_idx]
+            beam_conf = beam_conf[global_beam_idx]
+
+            # Append new token / confidence
+            beams = torch.cat([beams, next_token_flat.unsqueeze(1)], dim=1)
+            beam_conf = torch.cat([beam_conf, step_conf.unsqueeze(1)], dim=1)
+
+            # Update scores and finished flags
+            beam_scores = topk_scores
+            finished = finished.reshape(B * K)[global_beam_idx].reshape(B, K)
+            finished = finished | (next_token_id == eos_id)
+
+            if finished.all():
+                break
+
+        # Select best beam per batch item with mild length normalisation
+        length_penalty = beams.size(1) ** 0.6
+        best_k = (beam_scores / length_penalty).argmax(dim=-1)  # (B,)
+
+        batch_offset_1d = torch.arange(B, device=device) * K
+        global_best = batch_offset_1d + best_k                  # (B,)
+
+        best_seq = beams[global_best]                            # (B, L)
+
+        if not return_confidences:
+            return best_seq
+
+        best_conf = beam_conf[global_best]                       # (B, L)
+        return best_seq, best_conf
 
 
 # ---------------------------------------------------------------------------

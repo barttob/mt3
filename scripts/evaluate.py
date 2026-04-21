@@ -176,6 +176,8 @@ def evaluate(
     onset_tolerance: float = 0.05,
     offset_ratio: float = 0.2,
     offset_min_tolerance: float = 0.05,
+    beam_size: int = 1,
+    confidence_threshold: float = 0.0,
 ) -> dict:
     """Run evaluation on all files in ``data_dir``.
 
@@ -241,6 +243,8 @@ def evaluate(
             max_len=max_len,
             temperature=temperature,
             device=device,
+            beam_size=beam_size,
+            confidence_threshold=confidence_threshold,
         )
 
         overall_metrics_per_file.append(
@@ -442,6 +446,19 @@ def main(argv: list[str] | None = None) -> None:
         help="Minimum offset tolerance in seconds regardless of duration (default 50 ms).",
     )
     parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=1,
+        help="Beam search width (default 1 = greedy). Try 3 or 5 for better F1.",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.0,
+        help="Drop note_on tokens with decoder confidence below this value "
+             "(0 = disabled, try 0.2–0.4 to reduce false positives).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -492,9 +509,17 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[evaluate] loading checkpoint {args.checkpoint} …")
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     state = ckpt.get("model", ckpt)
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
     model.load_state_dict(state)
     model.to(device)
     model.eval()
+    if torch.cuda.is_available():
+        try:
+            model = torch.compile(model)
+            print("[evaluate] torch.compile: enabled")
+        except Exception as e:
+            print(f"[evaluate] torch.compile: skipped ({e})")
 
     # ------------------------------------------------------------------
     # Dry-run
@@ -533,6 +558,8 @@ def main(argv: list[str] | None = None) -> None:
         onset_tolerance=args.onset_tolerance,
         offset_ratio=args.offset_ratio,
         offset_min_tolerance=args.offset_min_tolerance,
+        beam_size=args.beam_size,
+        confidence_threshold=args.confidence_threshold,
     )
 
     # ------------------------------------------------------------------

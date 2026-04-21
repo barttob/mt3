@@ -1,3 +1,13 @@
+# Local config for Slakh2100 multi-instrument — RTX 4070 Ti (12 GB VRAM).
+#
+# Key differences vs colab_slakh_multi.yaml:
+#   - batch_size: 4 / grad_accum: 8  (12 GB VRAM; keeps effective batch = 32)
+#   - num_workers: 8  (local machine has more CPUs than Colab)
+#   - save_every: 10000  (no session timeout risk locally)
+#
+# Run:
+#   python scripts/train.py --config configs/local_slakh_multi.yaml
+
 data:
   dataset: slakh
   train_dir: data/processed/slakh/train
@@ -37,9 +47,9 @@ tokenizer:
   num_coarse: 75
 
 training:
-  batch_size: 64                    # A100 40G — was only using 8.5/40 GB
-  grad_accum_steps: 1              # effective batch = 64 (no accum needed)
-  lr: 0.0001                       # slightly lower for fine-tuning from piano
+  batch_size: 4                   # 4070 Ti 12 GB — safe with this model size
+  grad_accum_steps: 8             # effective batch = 32
+  lr: 0.0001
   warmup_steps: 4000
   max_steps: 300000
   max_epochs: 200
@@ -49,7 +59,7 @@ training:
   log_every: 100
   save_every: 10000
   eval_every: 10000
-  patience: 10                     # early stopping after 10 evals without improvement
-  num_workers: 4
+  patience: 10
+  num_workers: 8                  # local machine — more CPUs available
   fp16: false
-  bf16: true
+  bf16: true                      # 4070 Ti (Ada Lovelace) supports bf16 natively
