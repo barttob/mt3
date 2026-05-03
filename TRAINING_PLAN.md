@@ -19,10 +19,10 @@
 | M1 | MT3-like | d_model=256 (100k steps) | 🟡 Ważny | ~1–2 dni | ⬜ |
 | M2 | MT3-like | bez augmentacji (100k steps) | 🟢 Opcjonalny | ~1–2 dni | ⬜ |
 | M3 | MT3-like | **Baseline Slakh** (300k steps) | 🟡 Ważny | ~2–4 dni | ⬜ |
-| S1 | MT3-like | Slakh d_model=256 (200k steps) | 🟢 Opcjonalny | ~1–2 dni | ⬜ |
+| S1 | MT3-like | Slakh d_model=256 (200k steps) | 🟢 Opcjonalny | ~1–2 dni | ⬜+ |
 | S2 | MT3-like | Slakh fine-tune z M0 (150k steps) | 🟢 Opcjonalny | ~1–2 dni | ⬜ |
-| S3 | MT3-like | Slakh dłuższy kontekst 4s (300k steps) | 🟢 Opcjonalny | ~2–4 dni | ⬜ |
-| S4 | MT3-like | Slakh bez perkusji (300k steps) | 🟢 Opcjonalny | ~2–4 dni | ⬜ |
+| S3 | MT3-like | Slakh dłuższy kontekst 4s (300k steps) | 🟢 Opcjonalny | ~2–4 dni | + |
+| S4 | MT3-like | Slakh bez perkusji (300k steps) | 🟢 Opcjonalny | ~2–4 dni | ⬜/stopped |
 | S5 | MT3-like | Slakh→MAESTRO fine-tune (100k steps) | 🟡 Ważny | ~12–24 h | ⬜ |
 | S6 | MT3-like | Slakh+MAESTRO mix fine-tune (100k steps) | 🟡 Ważny | ~12–24 h | ⬜ |
 | N1 | MT3-like | +F1: hierarchical time (200k steps) | 🟡 Ważny | ~2–3 dni | ⬜ |

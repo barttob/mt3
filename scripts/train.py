@@ -391,7 +391,8 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
         model_state = ckpt["model"]
         if any(k.startswith("_orig_mod.") for k in model_state):
             model_state = {k.removeprefix("_orig_mod."): v for k, v in model_state.items()}
-        model.load_state_dict(model_state)
+        target = model._orig_mod if hasattr(model, "_orig_mod") else model
+        target.load_state_dict(model_state)
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt:
