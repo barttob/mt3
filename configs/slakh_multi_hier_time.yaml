@@ -1,0 +1,55 @@
+data:
+  dataset: slakh
+  train_dir: data/processed/slakh/train
+  val_dir: data/processed/slakh/validation
+  sample_rate: 16000
+  segment_samples: 32768
+  n_frames: 256
+
+audio:
+  n_fft: 4096
+  hop_length: 128
+  n_mels: 512
+
+model:
+  d_model: 512
+  nhead: 8
+  enc_layers: 8
+  dec_layers: 8
+  d_ff: 2048
+  dropout: 0.1
+  max_token_len: 1024
+  use_2d_patches: false
+  patch_f: 64
+  patch_t: 8
+  use_pitch_aware_attention: false
+  use_rope: false
+  use_conv_frontend: false
+  conv_layers: 2
+
+tokenizer:
+  multi_instrument: true
+  num_programs: 129               # 0-127 plus dedicated drum ID 128
+  time_step_ms: 8
+  max_time_steps: 600
+  use_hierarchical_time: true
+  coarse_step_ms: 64
+  num_coarse: 75
+
+training:
+  batch_size: 4                    # multi-instrument sequences are longer
+  grad_accum_steps: 8              # effective batch = 32
+  lr: 0.0001                       # slightly lower for fine-tuning from piano
+  warmup_steps: 4000
+  max_steps: 300000
+  max_epochs: 200
+  weight_decay: 0.01
+  grad_clip: 1.0
+  label_smoothing: 0.1
+  log_every: 100
+  save_every: 5000
+  eval_every: 5000
+  patience: 10                     # early stopping after 10 evals without improvement
+  num_workers: 4
+  fp16: false
+  bf16: true

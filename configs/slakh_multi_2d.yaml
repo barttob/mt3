@@ -1,11 +1,3 @@
-# Slakh training with drums excluded from the token vocabulary.
-# Hypothesis: drum events (highly rhythmic, non-pitched) introduce noise
-# that hurts onset F1 for melodic instruments. Removing them simplifies
-# the transcription target and may improve per-instrument metrics.
-#
-# Evaluation: use Slakh test set filtered to pitched instruments only.
-# Compare Frame/Onset F1 per-instrument against slakh_multi.yaml (S0/M3).
-
 data:
   dataset: slakh
   train_dir: data/processed/slakh/train
@@ -27,7 +19,7 @@ model:
   d_ff: 2048
   dropout: 0.1
   max_token_len: 1024
-  use_2d_patches: false
+  use_2d_patches: true
   patch_f: 64
   patch_t: 8
   use_pitch_aware_attention: false
@@ -37,8 +29,7 @@ model:
 
 tokenizer:
   multi_instrument: true
-  num_programs: 128                  # 0-127 only — drum ID 128 excluded
-  exclude_drums: true                # signal dataset loader to skip drum tracks
+  num_programs: 129               # 0-127 plus dedicated drum ID 128
   time_step_ms: 8
   max_time_steps: 600
   use_hierarchical_time: false
@@ -46,9 +37,9 @@ tokenizer:
   num_coarse: 75
 
 training:
-  batch_size: 4
-  grad_accum_steps: 8                # effective batch = 32
-  lr: 0.0001
+  batch_size: 4                    # multi-instrument sequences are longer
+  grad_accum_steps: 8              # effective batch = 32
+  lr: 0.0001                       # slightly lower for fine-tuning from piano
   warmup_steps: 4000
   max_steps: 300000
   max_epochs: 200
@@ -58,7 +49,7 @@ training:
   log_every: 100
   save_every: 5000
   eval_every: 5000
-  patience: 10
+  patience: 10                     # early stopping after 10 evals without improvement
   num_workers: 4
   fp16: false
   bf16: true
