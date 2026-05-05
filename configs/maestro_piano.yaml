@@ -47,8 +47,8 @@ training:
   grad_clip: 1.0
   label_smoothing: 0.1
   log_every: 100
-  save_every: 10000
-  eval_every: 10000
+  save_every: 2000
+  eval_every: 2000
   patience: 10                     # early stopping after 10 evals without improvement
   num_workers: 4
   fp16: false

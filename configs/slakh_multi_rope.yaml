@@ -23,7 +23,7 @@ model:
   patch_f: 64
   patch_t: 8
   use_pitch_aware_attention: false
-  use_rope: false
+  use_rope: true
   use_conv_frontend: false
   conv_layers: 2
 
@@ -32,7 +32,7 @@ tokenizer:
   num_programs: 129               # 0-127 plus dedicated drum ID 128
   time_step_ms: 8
   max_time_steps: 600
-  use_hierarchical_time: true
+  use_hierarchical_time: false
   coarse_step_ms: 64
   num_coarse: 75
 

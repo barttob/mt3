@@ -19,12 +19,12 @@ model:
   d_ff: 2048
   dropout: 0.1
   max_token_len: 1024
-  use_2d_patches: true
+  use_2d_patches: false
   patch_f: 64
   patch_t: 8
   use_pitch_aware_attention: false
   use_rope: false
-  use_conv_frontend: false
+  use_conv_frontend: true
   conv_layers: 2
 
 tokenizer:
