@@ -18,6 +18,10 @@ Usage
         --config configs/maestro_piano.yaml \\
         --checkpoint checkpoints/best.pt
 
+    python scripts/benchmark.py \
+        --config checkpoints/slakh_full-done-100k/colab_slakh_multi.yaml \
+        --checkpoint checkpoints/slakh_full-done-100k/best.pt
+
     # Save results to JSON
     python scripts/benchmark.py \\
         --config configs/maestro_piano.yaml \\
@@ -149,8 +153,8 @@ def _run_inference_gpu(
     waveform: torch.Tensor,
     max_len: int,
     sample_rate: int,
-) -> tuple[float, float]:
-    """Run one inference pass on GPU, return (inference_time_s, peak_vram_mb).
+) -> tuple[float, float, int]:
+    """Run one inference pass on GPU, return (inference_time_s, peak_vram_mb, n_tokens).
 
     Uses torch.cuda.Event for accurate GPU-side timing.
 
@@ -161,7 +165,7 @@ def _run_inference_gpu(
         sample_rate: Audio sample rate used to derive segment config.
 
     Returns:
-        Tuple of (inference_time_seconds, peak_vram_mb).
+        Tuple of (inference_time_seconds, peak_vram_mb, generated_token_count).
     """
     _reset_vram_peak()
     start_evt = torch.cuda.Event(enable_timing=True)
@@ -169,12 +173,13 @@ def _run_inference_gpu(
 
     with torch.no_grad():
         start_evt.record()
-        model.transcribe(waveform, max_len=max_len, temperature=0.0)
+        out = model.transcribe(waveform, max_len=max_len, temperature=0.0)
         end_evt.record()
 
     torch.cuda.synchronize()
     elapsed_ms = start_evt.elapsed_time(end_evt)
-    return elapsed_ms / 1000.0, _peak_vram_mb()
+    n_tokens = int(out.shape[1]) - 1  # exclude SOS seed token
+    return elapsed_ms / 1000.0, _peak_vram_mb(), n_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +190,8 @@ def _run_inference_cpu(
     model: torch.nn.Module,
     waveform: torch.Tensor,
     max_len: int,
-) -> float:
-    """Run one inference pass on CPU, return elapsed time in seconds.
+) -> tuple[float, int]:
+    """Run one inference pass on CPU, return (elapsed_s, n_tokens).
 
     Args:
         model: MT3Model in eval mode on CPU.
@@ -194,12 +199,14 @@ def _run_inference_cpu(
         max_len: Maximum token sequence length.
 
     Returns:
-        Elapsed wall-clock time in seconds.
+        Tuple of (elapsed_wall_clock_seconds, generated_token_count).
     """
     with torch.no_grad():
         t0 = time.perf_counter()
-        model.transcribe(waveform, max_len=max_len, temperature=0.0)
-        return time.perf_counter() - t0
+        out = model.transcribe(waveform, max_len=max_len, temperature=0.0)
+        elapsed = time.perf_counter() - t0
+    n_tokens = int(out.shape[1]) - 1
+    return elapsed, n_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -251,22 +258,28 @@ def benchmark_single_duration(
         # VRAM: median of vram_repeats
         vram_samples = []
         for _ in range(vram_repeats):
-            _, v = _run_inference_gpu(model, waveform, max_len, sample_rate)
+            _, v, _ = _run_inference_gpu(model, waveform, max_len, sample_rate)
             vram_samples.append(v)
         result["vram_mb"] = float(np.median(vram_samples))
 
-        # Timing: mean of gpu_repeats
+        # Timing + token count: mean of gpu_repeats
         times = []
+        token_counts = []
         for _ in range(gpu_repeats):
-            t, _ = _run_inference_gpu(model, waveform, max_len, sample_rate)
+            t, _, n = _run_inference_gpu(model, waveform, max_len, sample_rate)
             times.append(t)
+            token_counts.append(n)
         result["infer_time_s"] = float(np.mean(times))
         result["infer_time_std_s"] = float(np.std(times))
         result["rtf_gpu"] = result["infer_time_s"] / duration_s
+        result["tokens_mean"] = float(np.mean(token_counts))
+        result["tokens_per_s_gpu"] = result["tokens_mean"] / result["infer_time_s"] if result["infer_time_s"] > 0 else 0.0
     else:
         result["vram_mb"] = None
         result["infer_time_s"] = None
         result["rtf_gpu"] = None
+        result["tokens_mean"] = None
+        result["tokens_per_s_gpu"] = None
 
     # ------------------------------------------------------------------
     # CPU measurement (optional; model must be on CPU)
@@ -275,16 +288,21 @@ def benchmark_single_duration(
         cpu_waveform = waveform.cpu()
         cpu_model = model.cpu()
         cpu_times = []
+        cpu_token_counts = []
         for _ in range(cpu_repeats):
-            t = _run_inference_cpu(cpu_model, cpu_waveform, max_len)
+            t, n = _run_inference_cpu(cpu_model, cpu_waveform, max_len)
             cpu_times.append(t)
+            cpu_token_counts.append(n)
         # Move model back to original device if we moved it
         if device.type != "cpu":
             model.to(device)
-        result["rtf_cpu"] = float(np.mean(cpu_times)) / duration_s
+        mean_cpu_time = float(np.mean(cpu_times))
+        result["rtf_cpu"] = mean_cpu_time / duration_s
         result["rtf_cpu_std"] = float(np.std(cpu_times)) / duration_s
+        result["tokens_per_s_cpu"] = float(np.mean(cpu_token_counts)) / mean_cpu_time if mean_cpu_time > 0 else 0.0
     else:
         result["rtf_cpu"] = None
+        result["tokens_per_s_cpu"] = None
 
     return result
 
@@ -377,24 +395,143 @@ def _print_params(params: dict[str, int]) -> None:
 def _print_perf(row: dict, label: str = "20 s clip") -> None:
     print(f"\n=== Tab. 6.2 — Performance ({label}) ===")
     if row["vram_mb"] is not None:
-        print(f"  VRAM [MB]  : {row['vram_mb']:.1f}")
+        print(f"  VRAM [MB]     : {row['vram_mb']:.1f}")
     if row["rtf_gpu"] is not None:
-        print(f"  RTF_GPU    : {row['rtf_gpu']:.4f}  (infer={row['infer_time_s']:.3f} s)")
+        print(f"  RTF_GPU       : {row['rtf_gpu']:.4f}  (infer={row['infer_time_s']:.3f} s)")
+    if row.get("tokens_per_s_gpu") is not None:
+        print(f"  Tokens/s GPU  : {row['tokens_per_s_gpu']:.1f}  (mean {row['tokens_mean']:.0f} tokens)")
     if row["rtf_cpu"] is not None:
-        print(f"  RTF_CPU    : {row['rtf_cpu']:.4f}")
+        print(f"  RTF_CPU       : {row['rtf_cpu']:.4f}")
+    if row.get("tokens_per_s_cpu") is not None:
+        print(f"  Tokens/s CPU  : {row['tokens_per_s_cpu']:.1f}")
 
 
 def _print_scalability(rows: list[dict]) -> None:
     print("\n=== Tab. 6.3 — Scalability ===")
-    header = f"  {'Audio':>6s}  {'Infer [s]':>10s}  {'VRAM [MB]':>10s}  {'RTF_GPU':>10s}  {'RTF_CPU':>10s}"
+    header = f"  {'Audio':>6s}  {'Infer [s]':>10s}  {'VRAM [MB]':>10s}  {'RTF_GPU':>10s}  {'RTF_CPU':>10s}  {'Tok/s GPU':>10s}"
     print(header)
     print("  " + "-" * (len(header) - 2))
     for r in rows:
-        infer = f"{r['infer_time_s']:.3f}" if r["infer_time_s"] is not None else "    —"
-        vram  = f"{r['vram_mb']:.0f}"      if r["vram_mb"]      is not None else "    —"
-        rtfg  = f"{r['rtf_gpu']:.4f}"     if r["rtf_gpu"]      is not None else "    —"
-        rtfc  = f"{r['rtf_cpu']:.4f}"     if r["rtf_cpu"]      is not None else "    —"
-        print(f"  {r['duration_s']:>5.0f}s  {infer:>10s}  {vram:>10s}  {rtfg:>10s}  {rtfc:>10s}")
+        infer = f"{r['infer_time_s']:.3f}"      if r["infer_time_s"]      is not None else "         —"
+        vram  = f"{r['vram_mb']:.0f}"            if r["vram_mb"]           is not None else "         —"
+        rtfg  = f"{r['rtf_gpu']:.4f}"           if r["rtf_gpu"]           is not None else "         —"
+        rtfc  = f"{r['rtf_cpu']:.4f}"           if r["rtf_cpu"]           is not None else "         —"
+        toks  = f"{r['tokens_per_s_gpu']:.1f}"  if r.get("tokens_per_s_gpu") is not None else "         —"
+        print(f"  {r['duration_s']:>5.0f}s  {infer:>10s}  {vram:>10s}  {rtfg:>10s}  {rtfc:>10s}  {toks:>10s}")
+
+
+# ---------------------------------------------------------------------------
+# Per-layer timing (Sec. 8 — dominant layer analysis)
+# ---------------------------------------------------------------------------
+
+def profile_layer_timing(
+    model: torch.nn.Module,
+    waveform: torch.Tensor,
+    max_len: int,
+    device: torch.device,
+    warmup: int = 2,
+    repeats: int = 5,
+) -> dict[str, float]:
+    """Time each major submodule (frontend, encoder, decoder) via forward hooks.
+
+    The decoder accumulates time across all autoregressive steps.  Uses
+    synchronize-bracketed wall-clock timing so results are accurate on both
+    CPU and CUDA.
+
+    Args:
+        model: MT3Model in eval mode.
+        waveform: Input waveform on the target device.
+        max_len: Max decoding length.
+        device: Inference device.
+        warmup: Warmup passes before measurement.
+        repeats: Number of timed passes to average.
+
+    Returns:
+        Dict mapping submodule name -> mean elapsed seconds.
+    """
+    submodules: dict[str, torch.nn.Module] = {
+        name: getattr(model, name)
+        for name in ("frontend", "encoder", "decoder")
+        if hasattr(model, name)
+    }
+
+    def _sync() -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+    for _ in range(warmup):
+        with torch.no_grad():
+            model.transcribe(waveform, max_len=max_len, temperature=0.0)
+        _sync()
+
+    all_runs: dict[str, list[float]] = {n: [] for n in submodules}
+
+    for _ in range(repeats):
+        run_times: dict[str, float] = {n: 0.0 for n in submodules}
+        handles = []
+
+        for mod_name, mod in submodules.items():
+            def _make_hooks(name: str):
+                def pre_hook(module: torch.nn.Module, inp: tuple) -> None:
+                    _sync()
+                    module._layer_t0 = time.perf_counter()  # type: ignore[attr-defined]
+
+                def post_hook(module: torch.nn.Module, inp: tuple, out: object) -> None:
+                    _sync()
+                    run_times[name] += time.perf_counter() - module._layer_t0  # type: ignore[attr-defined]
+
+                return pre_hook, post_hook
+
+            pre, post = _make_hooks(mod_name)
+            handles.append(mod.register_forward_pre_hook(pre))
+            handles.append(mod.register_forward_hook(post))
+
+        with torch.no_grad():
+            model.transcribe(waveform, max_len=max_len, temperature=0.0)
+        _sync()
+
+        for h in handles:
+            h.remove()
+        for name, t in run_times.items():
+            all_runs[name].append(t)
+
+    return {name: float(np.mean(ts)) for name, ts in all_runs.items()}
+
+
+def _print_quality_metrics(results: dict) -> None:
+    overall = results["overall"]
+    print("\n=== Tab. 6.1 — Quality metrics ===")
+    print(f"  Files : {results['num_files']}  |  "
+          f"ref notes : {results['num_ref_notes']:,}  |  "
+          f"est notes : {results['num_est_notes']:,}")
+    print()
+    print(f"  {'Metric':<20s}  {'Precision':>10s}  {'Recall':>10s}  {'F1':>10s}")
+    print("  " + "-" * 56)
+    rows = [
+        ("Onset F1",        "onset_P",        "onset_R",        "onset_F1"),
+        ("Note F1 (+off.)", "onset_offset_P", "onset_offset_R", "onset_offset_F1"),
+        ("Frame F1",        "frame_P",         "frame_R",         "frame_F1"),
+    ]
+    for label, p_key, r_key, f1_key in rows:
+        p   = overall.get(p_key)
+        r   = overall.get(r_key)
+        f1  = overall.get(f1_key)
+        if f1 is not None:
+            ps  = f"{p * 100:.2f} %" if p  is not None else "—"
+            rs  = f"{r * 100:.2f} %" if r  is not None else "—"
+            f1s = f"{f1 * 100:.2f} %"
+            print(f"  {label:<20s}  {ps:>10s}  {rs:>10s}  {f1s:>10s}")
+
+
+def _print_layer_timing(timings: dict[str, float]) -> None:
+    total = sum(timings.values())
+    print("\n=== Sec. 8 — Per-module timing (dominant layer) ===")
+    print(f"  {'Module':<12s}  {'Time [s]':>10s}  {'%':>6s}")
+    print("  " + "-" * 32)
+    for name, t in sorted(timings.items(), key=lambda x: -x[1]):
+        pct = 100.0 * t / total if total > 0 else 0.0
+        print(f"  {name:<12s}  {t:>10.4f}  {pct:>5.1f}%")
+    print(f"  {'total':<12s}  {total:>10.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -470,10 +607,29 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip the scalability sweep (useful for a quick first run).",
     )
     parser.add_argument(
+        "--skip-layer-profile",
+        action="store_true",
+        help="Skip per-module timing (Sec. 8 dominant-layer analysis).",
+    )
+    parser.add_argument(
         "--max-len",
         type=int,
         default=1024,
         help="Max decoder token length passed to model.transcribe().",
+    )
+    parser.add_argument(
+        "--eval-data-dir",
+        type=Path,
+        default=None,
+        help="Directory with *_audio.npy / *_notes.npy pairs for Tab. 6.1 quality "
+             "metrics (onset F1, note F1, frame F1). Falls back to val_dir from "
+             "config when omitted. Skip entirely if neither is available.",
+    )
+    parser.add_argument(
+        "--max-eval-files",
+        type=int,
+        default=None,
+        help="Limit quality evaluation to this many files (default: all).",
     )
     args = parser.parse_args(argv)
 
@@ -537,6 +693,45 @@ def main(argv: list[str] | None = None) -> None:
     _print_params(params)
 
     # ------------------------------------------------------------------
+    # Tab. 6.1 — Quality metrics (requires preprocessed evaluation data)
+    # ------------------------------------------------------------------
+    from scripts.evaluate import evaluate as _evaluate_quality
+    from scripts.evaluate import _resolve_window_sizes
+
+    quality_results: dict = {}
+
+    # Resolve eval data dir: explicit flag > config val_dir
+    eval_data_dir: Path | None = args.eval_data_dir
+    if eval_data_dir is None:
+        data_cfg = config.get("data", {})
+        val_dir_str = data_cfg.get("val_dir")
+        if val_dir_str:
+            candidate = Path(val_dir_str)
+            if candidate.exists():
+                eval_data_dir = candidate
+
+    if eval_data_dir is not None and eval_data_dir.exists():
+        segment_samples, hop_samples = _resolve_window_sizes(config, None, None)
+        n_files_str = str(args.max_eval_files) if args.max_eval_files else "all"
+        print(f"\n[benchmark] quality evaluation on {eval_data_dir} ({n_files_str} files) …")
+        quality_results = _evaluate_quality(
+            model,
+            eval_data_dir,
+            sample_rate=sample_rate,
+            segment_samples=segment_samples,
+            hop_samples=hop_samples,
+            max_len=args.max_len,
+            device=device,
+            max_files=args.max_eval_files,
+        )
+        _print_quality_metrics(quality_results)
+    else:
+        print(
+            "\n[benchmark] NOTE: quality metrics skipped — no eval data found. "
+            "Pass --eval-data-dir <path> or set val_dir in config."
+        )
+
+    # ------------------------------------------------------------------
     # Tab. 6.2 reference clip
     # ------------------------------------------------------------------
     print(f"\n[benchmark] measuring performance on {args.ref_duration:.0f} s clip …")
@@ -571,6 +766,27 @@ def main(argv: list[str] | None = None) -> None:
         _print_scalability(scalability_rows)
 
     # ------------------------------------------------------------------
+    # Sec. 8 — per-module timing (dominant layer)
+    # ------------------------------------------------------------------
+    layer_timings: dict[str, float] = {}
+    if not args.skip_layer_profile:
+        ref_waveform = _make_waveform(args.ref_duration, sample_rate, device)
+        print(f"\n[benchmark] per-module timing on {args.ref_duration:.0f} s clip …")
+        layer_timings = profile_layer_timing(
+            model,
+            ref_waveform,
+            max_len=args.max_len,
+            device=device,
+        )
+        _print_layer_timing(layer_timings)
+
+    if args.cpu_repeats == 0:
+        print(
+            "\n[benchmark] NOTE: RTF_CPU not measured (--cpu-repeats=0). "
+            "Tab. 6.2 and Tab. 6.3 require it — re-run with --cpu-repeats 10."
+        )
+
+    # ------------------------------------------------------------------
     # JSON output
     # ------------------------------------------------------------------
     results = {
@@ -579,8 +795,10 @@ def main(argv: list[str] | None = None) -> None:
         "device": str(device),
         "environment": env,
         "parameters": params,
+        "quality": quality_results,
         "ref_performance": ref_row,
         "scalability": scalability_rows,
+        "layer_timing": layer_timings,
     }
 
     if args.output is not None:

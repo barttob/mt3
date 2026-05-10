@@ -36,7 +36,12 @@ class SinusoidalPositionalEncoding(nn.Module):
         Returns:
             Tensor of shape (B, T, d_model) with positional encoding added.
         """
-        return x + self.pe[:, : x.size(1)]
+        T = x.size(1)
+        if T > self.pe.shape[1]:
+            d_model = self.pe.shape[2]
+            pe_ext = _build_sinusoidal_pe(T, d_model).unsqueeze(0).to(self.pe.device, self.pe.dtype)
+            return x + pe_ext
+        return x + self.pe[:, :T]
 
 
 def _build_sinusoidal_pe(length: int, dim: int) -> torch.Tensor:
@@ -407,7 +412,11 @@ class PatchEmbedding2D(nn.Module):
         # Build 2D PE: concat time PE and freq PE for each (i_fp, i_tp) pair
         # time_pe[i_tp]: (n_tp, half) — same for all freq positions
         # freq_pe[i_fp]: (n_fp, half) — same for all time positions
-        t_pe = self.time_pe[:n_tp]               # (n_tp, half)
+        half = self.time_pe.shape[1]
+        if n_tp > self.time_pe.shape[0]:
+            t_pe = _build_sinusoidal_pe(n_tp, half).to(self.time_pe.device, self.time_pe.dtype)
+        else:
+            t_pe = self.time_pe[:n_tp]               # (n_tp, half)
         f_pe = self.freq_pe[:n_fp]               # (n_fp, half)
 
         # Broadcast to (n_fp, n_tp, half) each

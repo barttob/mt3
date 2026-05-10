@@ -369,6 +369,14 @@ class EventDecoder(nn.Module):
                     tgt_key_padding_mask=tgt_padding_mask,
                 )
         else:
+            if tgt_mask is not None and tgt_padding_mask is not None:
+                if tgt_padding_mask.dtype == torch.bool and tgt_mask.is_floating_point():
+                    float_pad = torch.zeros(
+                        tgt_padding_mask.shape,
+                        dtype=tgt_mask.dtype,
+                        device=tgt_padding_mask.device,
+                    )
+                    tgt_padding_mask = float_pad.masked_fill(tgt_padding_mask, float("-inf"))
             x = self.decoder(
                 tgt=x,
                 memory=enc_out,

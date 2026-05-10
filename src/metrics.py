@@ -128,6 +128,42 @@ def deduplicate_notes(notes: list[Note], overlap_s: float = 0.05) -> list[Note]:
 
 
 # ---------------------------------------------------------------------------
+# Piano-roll helper
+# ---------------------------------------------------------------------------
+
+def _notes_to_piano_roll(
+    notes: list[Note],
+    n_frames: int,
+    fps: float,
+    min_pitch: int = 21,
+    max_pitch: int = 108,
+) -> np.ndarray:
+    """Convert a note list to a boolean piano-roll of shape (n_frames, 88).
+
+    Args:
+        notes: Note dicts with onset, offset, pitch keys.
+        n_frames: Total time frames.
+        fps: Frames per second.
+        min_pitch: Lowest MIDI pitch (default A0 = 21).
+        max_pitch: Highest MIDI pitch (default C8 = 108).
+
+    Returns:
+        Boolean array of shape (n_frames, max_pitch - min_pitch + 1).
+    """
+    n_pitches = max_pitch - min_pitch + 1
+    roll = np.zeros((n_frames, n_pitches), dtype=bool)
+    for note in notes:
+        pitch_idx = note["pitch"] - min_pitch
+        if not 0 <= pitch_idx < n_pitches:
+            continue
+        t_start = int(np.floor(note["onset"] * fps))
+        t_end = max(t_start + 1, int(np.ceil(note["offset"] * fps)))
+        t_end = min(t_end, n_frames)
+        roll[t_start:t_end, pitch_idx] = True
+    return roll
+
+
+# ---------------------------------------------------------------------------
 # Core metric computation
 # ---------------------------------------------------------------------------
 
@@ -137,6 +173,7 @@ def evaluate_transcription(
     onset_tolerance: float = 0.05,
     offset_ratio: float = 0.2,
     offset_min_tolerance: float = 0.05,
+    frame_fps: float = 50.0,
 ) -> dict[str, float]:
     """Compute onset and onset+offset transcription F1 using mir_eval.
 
@@ -150,11 +187,13 @@ def evaluate_transcription(
             (default 0.2 = 20 %).
         offset_min_tolerance: Minimum offset tolerance in seconds regardless
             of note duration (default 50 ms).
+        frame_fps: Frame rate for binary piano-roll F1 (default 50 fps = 20 ms).
 
     Returns:
         Dict with keys:
         ``onset_P``, ``onset_R``, ``onset_F1``,
-        ``onset_offset_P``, ``onset_offset_R``, ``onset_offset_F1``.
+        ``onset_offset_P``, ``onset_offset_R``, ``onset_offset_F1``,
+        ``frame_P``, ``frame_R``, ``frame_F1``.
 
     Raises:
         ImportError: If ``mir_eval`` or ``librosa`` is not installed.
@@ -200,6 +239,23 @@ def evaluate_transcription(
         offset_min_tolerance=offset_min_tolerance,
     )
 
+    # Frame-level F1: binary piano-roll comparison at frame_fps
+    all_notes = ref_notes + est_notes
+    if all_notes:
+        max_offset = max(n["offset"] for n in all_notes)
+        n_frames = max(1, int(np.ceil((max_offset + 0.1) * frame_fps)))
+        ref_roll = _notes_to_piano_roll(ref_notes, n_frames, frame_fps)
+        est_roll = _notes_to_piano_roll(est_notes, n_frames, frame_fps)
+        tp = int(np.logical_and(ref_roll, est_roll).sum())
+        fp = int(np.logical_and(~ref_roll, est_roll).sum())
+        fn = int(np.logical_and(ref_roll, ~est_roll).sum())
+        p_frame = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r_frame = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1_frame = (2 * p_frame * r_frame / (p_frame + r_frame)
+                    if (p_frame + r_frame) > 0 else 0.0)
+    else:
+        p_frame = r_frame = f1_frame = 1.0  # both empty — perfect match
+
     return {
         "onset_P": float(p_on),
         "onset_R": float(r_on),
@@ -207,6 +263,9 @@ def evaluate_transcription(
         "onset_offset_P": float(p_off),
         "onset_offset_R": float(r_off),
         "onset_offset_F1": float(f1_off),
+        "frame_P": float(p_frame),
+        "frame_R": float(r_frame),
+        "frame_F1": float(f1_frame),
     }
 
 
