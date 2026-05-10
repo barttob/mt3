@@ -5,6 +5,7 @@ __pycache__
 data/processed
 runs/
 checkpoints/
+old/
 
 *.pt
 *.log

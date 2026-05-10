@@ -202,7 +202,10 @@ class RoPEMultiheadAttention(nn.Module):
             combined_mask = am
         if key_padding_mask is not None:
             kpm = torch.zeros(B, 1, T_q, T_k, device=query.device, dtype=q.dtype)
-            kpm = kpm.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+            # Cast to bool explicitly: torch.compile rejects float predicates in
+            # masked_fill even though eager mode silently accepts them.
+            # For float masks (-inf/0): -inf.bool()=True (pad), 0.0.bool()=False (valid).
+            kpm = kpm.masked_fill(key_padding_mask[:, None, None, :].bool(), float("-inf"))
             combined_mask = kpm if combined_mask is None else combined_mask + kpm
 
         dropout_p = self._dropout if self.training else 0.0
@@ -441,13 +444,15 @@ class SpectrogramEncoder(nn.Module):
     Supports four combinations of input embedding and position encoding:
 
     - Default: per-frame linear projection + 1D sinusoidal PE.
-    - ``use_conv_frontend=True``: Conv1d stack + 1D sinusoidal PE (or RoPE).
+    - ``use_conv_frontend=True``: Conv1d stack + 1D sinusoidal PE.
     - ``use_2d_patches=True``: ViT-style 2D patch projection with baked-in 2D
       sinusoidal PE.  ``use_conv_frontend`` is ignored in this mode.
-    - ``use_rope=True``: replaces additive sinusoidal PE with RoPE inside each
-      attention layer.  When ``use_2d_patches=True`` the 2D patch PE and RoPE
-      are complementary: patches carry frequency-band position and RoPE encodes
-      sequence position in attention.
+    - ``use_rope=True``: adds RoPE inside each attention layer *in addition to*
+      the sinusoidal PE applied at the input (non-patch modes only).  Absolute
+      position from sinusoidal PE is preserved so early encoder layers are not
+      left without any positional signal.  When ``use_2d_patches=True`` the
+      baked-in 2D patch PE already provides absolute position; RoPE adds
+      relative position sensitivity on top.
 
     All combinations feed into the same Transformer encoder stack (standard
     ``nn.TransformerEncoderLayer`` or ``RoPETransformerEncoderLayer`` when
@@ -501,12 +506,13 @@ class SpectrogramEncoder(nn.Module):
             # 2D PE is baked into PatchEmbedding2D; no extra pos_enc needed.
         elif use_conv_frontend:
             self.conv_frontend = ConvFrontend(n_mels, d_model, num_layers=conv_layers)
-            if not use_rope:
-                self.pos_enc = SinusoidalPositionalEncoding(d_model)
+            # Always add sinusoidal PE so early encoder layers have absolute position
+            # signal even when RoPE is active (RoPE provides relative positions in
+            # attention; sinusoidal PE provides absolute position at the input).
+            self.pos_enc = SinusoidalPositionalEncoding(d_model)
         else:
             self.input_proj = nn.Linear(n_mels, d_model)
-            if not use_rope:
-                self.pos_enc = SinusoidalPositionalEncoding(d_model)
+            self.pos_enc = SinusoidalPositionalEncoding(d_model)
 
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model)
@@ -543,16 +549,14 @@ class SpectrogramEncoder(nn.Module):
         """
         if self.use_2d_patches:
             x = self.patch_embed(spectrogram)           # (B, n_patches, d_model)
-            # RoPE (if enabled) applies inside rope_enc_layers; no additive PE here.
+            # 2D PE baked in; RoPE (if enabled) adds relative position in attention.
         elif self.use_conv_frontend:
             x = self.conv_frontend(spectrogram)         # (B, T, d_model)
-            if not self.use_rope:
-                x = self.pos_enc(x)
+            x = self.pos_enc(x)                         # absolute position always
         else:
             x = spectrogram.transpose(1, 2)             # (B, T, n_mels)
             x = self.input_proj(x)                      # (B, T, d_model)
-            if not self.use_rope:
-                x = self.pos_enc(x)
+            x = self.pos_enc(x)                         # absolute position always
 
         x = self.dropout(x)
 

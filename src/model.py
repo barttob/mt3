@@ -205,18 +205,25 @@ class MT3Model(nn.Module):
         # O(max_len) separate triu() allocations inside the decode loop.
         full_mask = nn.Transformer.generate_square_subsequent_mask(max_len, device=device)
 
+        # Incremental pitch context: compute once from the prompt, then update
+        # one position at a time after each generated token.  This avoids
+        # recomputing from scratch every step (O(S²) total → O(S) total) and
+        # prevents early decoding errors from cascading into later positions
+        # through repeated forward-fill over the full sequence.
+        running_pitch_ids: torch.Tensor | None = None
+        last_pitch: torch.Tensor | None = None
+        if self.decoder.use_pitch_aware_attention:
+            running_pitch_ids = compute_pitch_context(
+                generated, self.tokenizer.note_on_offset
+            )                                               # (B, P)
+            last_pitch = running_pitch_ids[:, -1]           # (B,)
+
         for _ in range(max_len - generated.size(1)):
             S = generated.size(1)
             tgt_mask = full_mask[:S, :S]
 
-            pitch_ids = None
-            if self.decoder.use_pitch_aware_attention:
-                pitch_ids = compute_pitch_context(
-                    generated, self.tokenizer.note_on_offset
-                )
-
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"):
-                logits = self.decoder(generated, enc_out, pitch_ids=pitch_ids, tgt_mask=tgt_mask)
+                logits = self.decoder(generated, enc_out, pitch_ids=running_pitch_ids, tgt_mask=tgt_mask)
             next_logits = logits[:, -1, :]  # (B, vocab_size)
 
             probs = torch.softmax(next_logits.float(), dim=-1)  # fp32 for stability
@@ -228,6 +235,17 @@ class MT3Model(nn.Module):
 
             step_confidences.append(probs.max(dim=-1).values)   # (B,)
             generated = torch.cat([generated, next_token], dim=1)
+
+            # Incrementally extend running_pitch_ids by one position.
+            if running_pitch_ids is not None:
+                token_flat = next_token.squeeze(1)              # (B,)
+                note_on_off = self.tokenizer.note_on_offset
+                is_note_on = (token_flat >= note_on_off) & (token_flat < note_on_off + 128)
+                new_pitch = torch.where(is_note_on, token_flat - note_on_off, last_pitch)
+                last_pitch = new_pitch
+                running_pitch_ids = torch.cat(
+                    [running_pitch_ids, new_pitch.unsqueeze(1)], dim=1
+                )                                               # (B, S+1)
 
             if (next_token == eos_id).all():
                 break
@@ -299,16 +317,23 @@ class MT3Model(nn.Module):
 
         full_mask = nn.Transformer.generate_square_subsequent_mask(max_len, device=device)
 
+        # Incremental pitch tracking for beam search: same principle as greedy decode.
+        # running_beam_pitch_ids grows by one column per step and is reordered when
+        # beams are reordered (following the parent beam indices).
+        running_beam_pitch_ids: torch.Tensor | None = None
+        last_beam_pitch: torch.Tensor | None = None
+        if self.decoder.use_pitch_aware_attention:
+            running_beam_pitch_ids = compute_pitch_context(
+                beams, self.tokenizer.note_on_offset
+            )                                               # (B*K, P)
+            last_beam_pitch = running_beam_pitch_ids[:, -1]  # (B*K,)
+
         for _ in range(max_len - P):
             S = beams.size(1)
             tgt_mask = full_mask[:S, :S]
 
-            pitch_ids = None
-            if self.decoder.use_pitch_aware_attention:
-                pitch_ids = compute_pitch_context(beams, self.tokenizer.note_on_offset)
-
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"):
-                logits = self.decoder(beams, enc_out_exp, pitch_ids=pitch_ids, tgt_mask=tgt_mask)
+                logits = self.decoder(beams, enc_out_exp, pitch_ids=running_beam_pitch_ids, tgt_mask=tgt_mask)
 
             next_logits = logits[:, -1, :].float()               # (B*K, vocab)
             log_probs = torch.log_softmax(next_logits, dim=-1)   # (B*K, vocab)
@@ -336,13 +361,25 @@ class MT3Model(nn.Module):
             # Per-token confidence: softmax prob of chosen token under parent beam
             step_conf = log_probs[global_beam_idx, next_token_flat].exp()  # (B*K,)
 
-            # Reorder sequences and conf history to follow parent beams
+            # Reorder sequences, conf history, and pitch context to follow parent beams
             beams = beams[global_beam_idx]
             beam_conf = beam_conf[global_beam_idx]
 
             # Append new token / confidence
             beams = torch.cat([beams, next_token_flat.unsqueeze(1)], dim=1)
             beam_conf = torch.cat([beam_conf, step_conf.unsqueeze(1)], dim=1)
+
+            # Incrementally update beam pitch context
+            if running_beam_pitch_ids is not None:
+                running_beam_pitch_ids = running_beam_pitch_ids[global_beam_idx]
+                last_beam_pitch = last_beam_pitch[global_beam_idx]
+                note_on_off = self.tokenizer.note_on_offset
+                is_note_on = (next_token_flat >= note_on_off) & (next_token_flat < note_on_off + 128)
+                new_pitch = torch.where(is_note_on, next_token_flat - note_on_off, last_beam_pitch)
+                last_beam_pitch = new_pitch
+                running_beam_pitch_ids = torch.cat(
+                    [running_beam_pitch_ids, new_pitch.unsqueeze(1)], dim=1
+                )
 
             # Update scores and finished flags
             beam_scores = topk_scores

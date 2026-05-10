@@ -69,7 +69,7 @@ class PitchAwareDecoderLayer(nn.Module):
 
         # 128 MIDI pitch embeddings + 1 null (index 128, initialised to 0)
         self.pitch_embedding = nn.Embedding(129, d_model)
-        nn.init.normal_(self.pitch_embedding.weight, std=0.02)
+        nn.init.normal_(self.pitch_embedding.weight, std=d_model ** -0.5)
         with torch.no_grad():
             self.pitch_embedding.weight[128].zero_()
 

@@ -1,7 +1,7 @@
 data:
-  dataset: maestro
-  train_dir: data/processed/maestro/train
-  val_dir: data/processed/maestro/validation
+  dataset: slakh
+  train_dir: data/processed/slakh/train
+  val_dir: data/processed/slakh/validation
   sample_rate: 16000
   segment_samples: 32768
   n_frames: 256
@@ -24,12 +24,12 @@ model:
   patch_t: 8
   use_pitch_aware_attention: false
   use_rope: false
-  use_conv_frontend: false
+  use_conv_frontend: true
   conv_layers: 2
 
 tokenizer:
-  multi_instrument: true   # piano-only, no program tokens
-  num_programs: 129
+  multi_instrument: true
+  num_programs: 129               # 0-127 plus dedicated drum ID 128
   time_step_ms: 8
   max_time_steps: 600
   use_hierarchical_time: false
@@ -37,18 +37,19 @@ tokenizer:
   num_coarse: 75
 
 training:
-  batch_size: 4
-  grad_accum_steps: 8
-  lr: 0.00003              # 10x lower than scratch — key for finetuning
-  warmup_steps: 1000       # shorter warmup
-  max_steps: 100000         # much shorter run
+  batch_size: 4                    # multi-instrument sequences are longer
+  grad_accum_steps: 8              # effective batch = 32
+  lr: 0.0001                       # slightly lower for fine-tuning from piano
+  warmup_steps: 4000
+  max_steps: 300000
+  max_epochs: 200
   weight_decay: 0.01
   grad_clip: 1.0
   label_smoothing: 0.1
   log_every: 100
   save_every: 5000
   eval_every: 5000
-  patience: 10
+  patience: 10                     # early stopping after 10 evals without improvement
   num_workers: 4
   fp16: false
   bf16: true

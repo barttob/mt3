@@ -126,13 +126,17 @@ def _resolve_window_sizes(
 
     if segment_seconds is not None:
         segment_samples = int(segment_seconds * sample_rate)
+    elif data_cfg.get("segment_samples") is not None:
+        # Use training segment length directly — ensures eval matches training window.
+        segment_samples = int(data_cfg["segment_samples"])
     else:
         n_frames = data_cfg.get("n_frames")
         hop_length = audio_cfg.get("hop_length")
         if n_frames is not None and hop_length is not None:
             segment_samples = int(n_frames) * int(hop_length)
         else:
-            segment_samples = int(data_cfg.get("segment_samples", 256_000))
+            # 2.048 s at 16 kHz — matches default training segment
+            segment_samples = 32_768
 
     if overlap is not None:
         if not (0.0 < overlap < 1.0):
@@ -166,8 +170,8 @@ def evaluate(
     model,
     data_dir: Path,
     sample_rate: int = 16000,
-    segment_samples: int = 256_000,
-    hop_samples: int = 128_000,
+    segment_samples: int = 32_768,
+    hop_samples: int = 16_384,
     max_len: int = 1024,
     temperature: float = 0.0,
     per_program: bool = False,
@@ -497,6 +501,8 @@ def main(argv: list[str] | None = None) -> None:
     segment_samples, hop_samples = _resolve_window_sizes(
         config, args.segment_seconds, args.hop_seconds, overlap=args.overlap
     )
+    print(f"[evaluate] segment={segment_samples} samples ({segment_samples / sample_rate:.3f} s)  "
+          f"hop={hop_samples} samples ({hop_samples / sample_rate:.3f} s)")
 
     # ------------------------------------------------------------------
     # Model

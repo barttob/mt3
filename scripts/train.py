@@ -246,6 +246,19 @@ def train(config: dict, resume: str | Path | None = None, dry_run: bool = False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] parameters={n_params:,}  vocab_size={model.tokenizer.vocab_size}")
 
+    # When F1 (hierarchical time) is active the vocabulary shrinks by ~50%.
+    # Scale label_smoothing proportionally so the per-class smoothing noise
+    # stays at the same relative magnitude as in the flat-vocab baseline.
+    if model.tokenizer.use_hierarchical_time:
+        tok_cfg_local = config.get("tokenizer", {})
+        multi = tok_cfg_local.get("multi_instrument", False)
+        max_ts = tok_cfg_local.get("max_time_steps", 600)
+        num_programs = tok_cfg_local.get("num_programs", 129 if multi else 128)
+        flat_vocab = 4 + max_ts + 128 + 128 + 128 + (num_programs if multi else 0)
+        label_smoothing = label_smoothing * model.tokenizer.vocab_size / flat_vocab
+        print(f"[train] F1 hierarchical time: vocab {flat_vocab}→{model.tokenizer.vocab_size}, "
+              f"label_smoothing scaled to {label_smoothing:.4f}")
+
     # torch.compile gives 30-50% throughput gain on A100 via kernel fusion.
     if torch.cuda.is_available() and not dry_run:
         try:
