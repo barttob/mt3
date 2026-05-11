@@ -458,7 +458,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--confidence-threshold",
         type=float,
-        default=0.0,
+        default=0,
         help="Drop note_on tokens with decoder confidence below this value "
              "(0 = disabled, try 0.2–0.4 to reduce false positives).",
     )

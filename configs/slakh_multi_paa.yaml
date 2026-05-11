@@ -17,7 +17,7 @@ model:
   enc_layers: 8
   dec_layers: 8
   d_ff: 2048
-  dropout: 0.1
+  dropout: 0.2
   max_token_len: 1024
   use_2d_patches: false
   patch_f: 64
@@ -40,12 +40,12 @@ training:
   batch_size: 4                    # multi-instrument sequences are longer
   grad_accum_steps: 8              # effective batch = 32
   lr: 0.0001                       # slightly lower for fine-tuning from piano
-  warmup_steps: 4000
-  max_steps: 300000
+  warmup_steps: 2000
+  max_steps: 100000
   max_epochs: 200
-  weight_decay: 0.01
+  weight_decay: 0.1
   grad_clip: 1.0
-  label_smoothing: 0.1
+  label_smoothing: 0.15
   log_every: 100
   save_every: 5000
   eval_every: 5000

@@ -723,6 +723,8 @@ def main(argv: list[str] | None = None) -> None:
             max_len=args.max_len,
             device=device,
             max_files=args.max_eval_files,
+            beam_size=3,
+            confidence_threshold=0.4,  # same default as in evaluate.py
         )
         _print_quality_metrics(quality_results)
     else:
