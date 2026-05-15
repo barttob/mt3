@@ -182,6 +182,7 @@ def evaluate(
     offset_min_tolerance: float = 0.05,
     beam_size: int = 1,
     confidence_threshold: float = 0.0,
+    exclude_drums: bool = False,
 ) -> dict:
     """Run evaluation on all files in ``data_dir``.
 
@@ -204,6 +205,8 @@ def evaluate(
         onset_tolerance: Onset tolerance in seconds for mir_eval (default 50 ms).
         offset_ratio: Offset tolerance as a fraction of note duration (default 0.2).
         offset_min_tolerance: Minimum offset tolerance in seconds (default 50 ms).
+        exclude_drums: If True, drum notes (program 128) are removed from both
+            reference and estimate before computing metrics.
 
     Returns:
         Dict with keys ``overall`` (aggregated metrics), optionally
@@ -217,6 +220,8 @@ def evaluate(
         macro_average_metrics,
         per_program_metrics,
     )
+
+    _DRUM_PROGRAM = 128
 
     if device is None:
         device = next(model.parameters()).device
@@ -237,6 +242,8 @@ def evaluate(
     for idx, (audio_path, notes_path) in enumerate(pairs):
         audio = np.load(audio_path)
         ref_notes = _load_notes_from_npy(notes_path)
+        if exclude_drums:
+            ref_notes = [n for n in ref_notes if n.get("program") != _DRUM_PROGRAM]
 
         est_notes = transcribe_full_audio(
             model,
@@ -250,6 +257,8 @@ def evaluate(
             beam_size=beam_size,
             confidence_threshold=confidence_threshold,
         )
+        if exclude_drums:
+            est_notes = [n for n in est_notes if n.get("program") != _DRUM_PROGRAM]
 
         overall_metrics_per_file.append(
             evaluate_transcription(
@@ -545,6 +554,10 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[evaluate] ERROR: data directory not found: {data_dir}", file=sys.stderr)
         sys.exit(1)
 
+    exclude_drums: bool = bool(config.get("tokenizer", {}).get("exclude_drums", False))
+    if exclude_drums:
+        print("[evaluate] exclude_drums=True: drum notes (program 128) will be removed from ref and est before scoring")
+
     print(f"[evaluate] evaluating split '{args.split}' from {data_dir} …")
 
     # ------------------------------------------------------------------
@@ -566,6 +579,7 @@ def main(argv: list[str] | None = None) -> None:
         offset_min_tolerance=args.offset_min_tolerance,
         beam_size=args.beam_size,
         confidence_threshold=args.confidence_threshold,
+        exclude_drums=exclude_drums,
     )
 
     # ------------------------------------------------------------------

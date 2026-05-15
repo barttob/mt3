@@ -447,12 +447,10 @@ class SpectrogramEncoder(nn.Module):
     - ``use_conv_frontend=True``: Conv1d stack + 1D sinusoidal PE.
     - ``use_2d_patches=True``: ViT-style 2D patch projection with baked-in 2D
       sinusoidal PE.  ``use_conv_frontend`` is ignored in this mode.
-    - ``use_rope=True``: adds RoPE inside each attention layer *in addition to*
-      the sinusoidal PE applied at the input (non-patch modes only).  Absolute
-      position from sinusoidal PE is preserved so early encoder layers are not
-      left without any positional signal.  When ``use_2d_patches=True`` the
-      baked-in 2D patch PE already provides absolute position; RoPE adds
-      relative position sensitivity on top.
+    - ``use_rope=True``: replaces sinusoidal additive PE with RoPE inside each
+      attention layer (non-patch modes only).  When ``use_2d_patches=True`` the
+      baked-in 2D patch PE provides absolute position; RoPE adds relative
+      position sensitivity on top.
 
     All combinations feed into the same Transformer encoder stack (standard
     ``nn.TransformerEncoderLayer`` or ``RoPETransformerEncoderLayer`` when
@@ -468,8 +466,8 @@ class SpectrogramEncoder(nn.Module):
         use_2d_patches: If True, use PatchEmbedding2D instead of per-frame projection.
         patch_f: Mel bins per patch (only used when use_2d_patches=True).
         patch_t: Time frames per patch (only used when use_2d_patches=True).
-        use_rope: If True, replace sinusoidal additive PE with RoPE inside
-            each encoder self-attention layer.
+        use_rope: If True, use RoPE inside each encoder self-attention layer
+            instead of sinusoidal additive PE at the input.
         use_conv_frontend: If True, replace the per-frame linear projection
             with a stack of Conv1d blocks.  Ignored when use_2d_patches=True.
         conv_layers: Number of Conv1d + GELU blocks in the conv frontend.
@@ -506,13 +504,12 @@ class SpectrogramEncoder(nn.Module):
             # 2D PE is baked into PatchEmbedding2D; no extra pos_enc needed.
         elif use_conv_frontend:
             self.conv_frontend = ConvFrontend(n_mels, d_model, num_layers=conv_layers)
-            # Always add sinusoidal PE so early encoder layers have absolute position
-            # signal even when RoPE is active (RoPE provides relative positions in
-            # attention; sinusoidal PE provides absolute position at the input).
-            self.pos_enc = SinusoidalPositionalEncoding(d_model)
+            if not use_rope:
+                self.pos_enc = SinusoidalPositionalEncoding(d_model)
         else:
             self.input_proj = nn.Linear(n_mels, d_model)
-            self.pos_enc = SinusoidalPositionalEncoding(d_model)
+            if not use_rope:
+                self.pos_enc = SinusoidalPositionalEncoding(d_model)
 
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model)
@@ -552,11 +549,13 @@ class SpectrogramEncoder(nn.Module):
             # 2D PE baked in; RoPE (if enabled) adds relative position in attention.
         elif self.use_conv_frontend:
             x = self.conv_frontend(spectrogram)         # (B, T, d_model)
-            x = self.pos_enc(x)                         # absolute position always
+            if not self.use_rope:
+                x = self.pos_enc(x)
         else:
             x = spectrogram.transpose(1, 2)             # (B, T, n_mels)
             x = self.input_proj(x)                      # (B, T, d_model)
-            x = self.pos_enc(x)                         # absolute position always
+            if not self.use_rope:
+                x = self.pos_enc(x)
 
         x = self.dropout(x)
 

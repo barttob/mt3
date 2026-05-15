@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 import yaml
 
-from src.augmentation import SpecAugment
 from src.decoder import EventDecoder
 from src.encoder import SpectrogramEncoder
 from src.frontend import SpectrogramFrontend
@@ -84,7 +83,6 @@ class MT3Model(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.tokenizer = tokenizer
-        self.spec_augment = SpecAugment()
 
     def forward(
         self,
@@ -107,8 +105,6 @@ class MT3Model(nn.Module):
             logits: Token logits of shape (B, S, vocab_size).
         """
         spec = self.frontend(waveform)                              # (B, n_mels, T)
-        if self.training:
-            spec = self.spec_augment(spec)
         enc_out = self.encoder(spec)                                # (B, T, d_model)
 
         pitch_ids = None
